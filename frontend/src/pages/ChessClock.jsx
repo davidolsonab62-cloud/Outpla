@@ -2,11 +2,25 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { useAuth } from "@/App";
-import { ArrowLeft, Clock, Pause, Play, RotateCcw } from "lucide-react";
+import { useAuth, API } from "@/App";
+import { ArrowLeft, Bookmark, Clock, Pause, Play, RotateCcw, Trash2 } from "lucide-react";
 import PageHeader from "@/components/layout/PageHeader";
+import { toast } from "sonner";
+import axios from "axios";
 
 const DEFAULT_MINUTES = 5;
+
+// Phase 4e: built-in defaults, mirroring Lobby.jsx's TIME_CONTROLS so the
+// same presets are familiar across the app. "Custom Chess Clock presets
+// beyond the defaults" (the spec's Phase 4e item) means presets saved
+// beyond this list - see the saved-presets section below.
+const DEFAULT_CLOCK_PRESETS = [
+  { label: "1 min", minutes: 1 },
+  { label: "3 min", minutes: 3 },
+  { label: "5 min", minutes: 5 },
+  { label: "10 min", minutes: 10 },
+  { label: "15 min", minutes: 15 },
+];
 
 const formatCountdown = (secs) => {
   const m = Math.floor(secs / 60).toString().padStart(2, "0");
@@ -42,7 +56,7 @@ const exitFullscreen = () => {
 };
 
 export default function ChessClock() {
-  useAuth();
+  const { token } = useAuth();
   const navigate = useNavigate();
   const [whiteDuration, setWhiteDuration] = useState(DEFAULT_MINUTES);
   const [blackDuration, setBlackDuration] = useState(DEFAULT_MINUTES);
@@ -54,6 +68,86 @@ export default function ChessClock() {
   const [simulatedFullscreen, setSimulatedFullscreen] = useState(false);
   const intervalRef = useRef(null);
   const pageRef = useRef(null);
+
+  // Phase 4e: saved custom presets beyond DEFAULT_CLOCK_PRESETS. Loaded
+  // once on mount so the "X of Y free saves left" copy and per-save cost
+  // are visible before the user commits, same spirit as Phase 5's other
+  // gated actions.
+  const [savedPresets, setSavedPresets] = useState([]);
+  const [presetStatus, setPresetStatus] = useState(null);
+  const [presetSaving, setPresetSaving] = useState(false);
+
+  const applyPreset = useCallback((minutes) => {
+    setClockRunning(false);
+    setClockWinner(null);
+    setActiveClock("white");
+    setSimulatedFullscreen(false);
+    exitFullscreen();
+    setWhiteDuration(minutes);
+    setBlackDuration(minutes);
+    setWhiteTimeRemaining(minutes * 60);
+    setBlackTimeRemaining(minutes * 60);
+  }, []);
+
+  const refreshPresets = useCallback(() => {
+    if (!token) return;
+    axios
+      .get(`${API}/clock-presets`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => {
+        setSavedPresets(response.data.presets || []);
+        setPresetStatus(response.data);
+      })
+      .catch(() => {});
+  }, [token]);
+
+  useEffect(() => {
+    refreshPresets();
+  }, [refreshPresets]);
+
+  const saveCurrentAsPreset = useCallback(async () => {
+    if (!token) {
+      toast.error("Log in to save custom presets");
+      return;
+    }
+    const name = window.prompt("Name this preset (e.g. \"My blitz\"):");
+    if (!name || !name.trim()) return;
+
+    setPresetSaving(true);
+    try {
+      const response = await axios.post(
+        `${API}/clock-presets`,
+        { name: name.trim(), white_minutes: whiteDuration, black_minutes: blackDuration, increment_seconds: 0 },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.data.paid) {
+        toast.success(`Preset saved — ${response.data.credits_charged} credits charged.`);
+      } else {
+        toast.success("Preset saved");
+      }
+      refreshPresets();
+    } catch (error) {
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        toast.error(`Not enough credits — an extra preset costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        return;
+      }
+      toast.error(typeof detail === "string" ? detail : "Failed to save preset");
+    } finally {
+      setPresetSaving(false);
+    }
+  }, [token, whiteDuration, blackDuration, navigate, refreshPresets]);
+
+  const deletePreset = useCallback(async (presetId) => {
+    if (!token) return;
+    try {
+      await axios.delete(`${API}/clock-presets/${presetId}`, { headers: { Authorization: `Bearer ${token}` } });
+      setSavedPresets((prev) => prev.filter((p) => p.preset_id !== presetId));
+    } catch (error) {
+      toast.error("Failed to delete preset");
+    }
+  }, [token]);
 
   const resetClock = useCallback(() => {
     setClockRunning(false);
@@ -261,6 +355,62 @@ export default function ChessClock() {
           </div>
 
           <div className="mt-5 grid gap-3">
+            {/* Phase 4e: quick-select defaults, mirroring Lobby's time
+                controls. Tapping one sets both sides and resets the clock. */}
+            <div className="flex flex-wrap gap-2">
+              {DEFAULT_CLOCK_PRESETS.map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  onClick={() => applyPreset(preset.minutes)}
+                  className="rounded-full border border-hair bg-surface-2 px-3 py-1 text-xs text-text-secondary hover:bg-surface-1 hover:text-ink transition"
+                >
+                  {preset.label}
+                </button>
+              ))}
+              {savedPresets.map((preset) => (
+                <span
+                  key={preset.preset_id}
+                  className="inline-flex items-center gap-1 rounded-full border border-brand/40 bg-brand-dim px-3 py-1 text-xs text-brand"
+                >
+                  <button
+                    type="button"
+                    onClick={() => applyPreset(preset.white_minutes)}
+                    className="hover:underline"
+                  >
+                    {preset.name} ({preset.white_minutes}m)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => deletePreset(preset.preset_id)}
+                    aria-label={`Delete ${preset.name}`}
+                    className="text-brand/60 hover:text-danger"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={saveCurrentAsPreset}
+                disabled={presetSaving}
+                className="h-auto rounded-full px-3 py-1 text-xs"
+              >
+                <Bookmark className="w-3 h-3 mr-1" />
+                {presetSaving
+                  ? "Saving…"
+                  : presetStatus && presetStatus.remaining_free <= 0
+                  ? `Save as preset (${presetStatus.extra_preset_cost ?? "?"} cr)`
+                  : "Save as preset"}
+              </Button>
+            </div>
+            {presetStatus && presetStatus.remaining_free > 0 && (
+              <p className="text-xs text-text-secondary">
+                {presetStatus.remaining_free} of {presetStatus.free_limit} free custom preset saves left.
+              </p>
+            )}
+
             <div className="grid grid-cols-2 gap-3">
               <label className="rounded-2xl bg-surface-2 p-3 text-sm text-text-secondary">
                 White minutes

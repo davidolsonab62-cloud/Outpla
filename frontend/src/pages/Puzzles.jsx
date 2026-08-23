@@ -19,6 +19,7 @@ export default function Puzzles() {
   const navigate = useNavigate();
   const [puzzle, setPuzzle] = useState(null);
   const [progress, setProgress] = useState(null);
+  const [packs, setPacks] = useState(null);
   const [answer, setAnswer] = useState("");
   const [loading, setLoading] = useState(true);
   const [solving, setSolving] = useState(false);
@@ -78,7 +79,36 @@ export default function Puzzles() {
     }
   }, [token]);
 
-  const fetchPuzzle = useCallback(async () => {
+  const fetchPacks = useCallback(async () => {
+    const headers = token
+      ? { headers: { Authorization: `Bearer ${token}` }, withCredentials: true }
+      : { withCredentials: true };
+    try {
+      const response = await axios.get(`${API}/puzzles/packs`, headers);
+      setPacks(response.data.packs || []);
+    } catch (error) {
+      console.error("Failed to fetch puzzle packs", error);
+    }
+  }, [token]);
+
+  // Phase 5: ambient "X free skips/retries left today" - fetched
+  // read-only so the price is visible before the user runs out, not only
+  // after a 402. Refreshed alongside packs/progress since a skip or a
+  // wrong guess both change it.
+  const [budgetStatus, setBudgetStatus] = useState(null);
+  const fetchBudgetStatus = useCallback(async () => {
+    if (!token) return;
+    try {
+      const response = await axios.get(`${API}/puzzles/budget-status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setBudgetStatus(response.data);
+    } catch (error) {
+      console.error("Failed to fetch puzzle budget status", error);
+    }
+  }, [token]);
+
+  const fetchPuzzle = useCallback(async (difficultyOverride) => {
     const headers = token
       ? { headers: { Authorization: `Bearer ${token}` }, withCredentials: true }
       : { withCredentials: true };
@@ -94,24 +124,42 @@ export default function Puzzles() {
     try {
       // /puzzles/next both hands back the puzzle to display AND opens a
       // fresh server-side solving session (attempt_id) that the board's
-      // moves get checked against, one ply at a time.
-      const response = await axios.get(`${API}/puzzles/next`, headers);
+      // moves get checked against, one ply at a time. Requesting a new
+      // puzzle while the last one is unsolved counts as a skip server-side
+      // (Phase 4b) - free up to a daily limit, then charged in credits.
+      // Picking a difficulty above the one you've naturally earned is a
+      // "pack" unlock, also charged in credits (see /puzzles/packs).
+      const params = {};
+      if (difficultyOverride) params.difficulty = difficultyOverride;
+      const response = await axios.get(`${API}/puzzles/next`, { ...headers, params });
       const newChess = new Chess(response.data.fen);
       setChess(newChess);
       setPosition(newChess.fen());
       setConfirmedFen(newChess.fen());
       setPuzzle(response.data);
       setStatusMessage(null);
+      fetchPacks();
+      fetchBudgetStatus();
     } catch (error) {
       console.error("Failed to load next puzzle", error);
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        const label = detail.feature_key === "puzzle_pack" ? "unlocking this puzzle pack" : "skipping this puzzle";
+        toast.error(`Not enough credits — ${label} costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        setStatusMessage("Not enough credits for that. Your current puzzle is still active.");
+        setLoading(false);
+        return;
+      }
       setPuzzle(null);
       setStatusMessage(
-        error.response?.data?.detail || "Unable to load a puzzle right now. Try again later."
+        detail || "Unable to load a puzzle right now. Try again later."
       );
     } finally {
       setLoading(false);
     }
-  }, [token]);
+  }, [token, navigate, fetchPacks, fetchBudgetStatus]);
 
 
 
@@ -120,6 +168,8 @@ export default function Puzzles() {
       if (isAuthenticated) {
         fetchProgress();
         fetchPuzzle();
+        fetchPacks();
+        fetchBudgetStatus();
       } else {
         setLoading(false);
         setPuzzle(null);
@@ -127,7 +177,7 @@ export default function Puzzles() {
         setStatusMessage("Please log in to load puzzles.");
       }
     }
-  }, [authLoading, isAuthenticated, fetchProgress, fetchPuzzle]);
+  }, [authLoading, isAuthenticated, fetchProgress, fetchPuzzle, fetchPacks, fetchBudgetStatus]);
 
   // Shared by drag-and-drop and the typed-move box: apply a move to a copy
   // of the current position using chess.js's own legal-move generator.
@@ -165,9 +215,9 @@ export default function Puzzles() {
         const revertChess = new Chess(confirmedFen);
         setChess(revertChess);
         setPosition(revertChess.fen());
+        fetchBudgetStatus();
         return;
       }
-
       let latestFen = trialChess.fen();
       setConfirmedFen(latestFen);
 
@@ -198,8 +248,19 @@ export default function Puzzles() {
       }
     } catch (error) {
       console.error("Puzzle move failed", error);
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        // Out of free daily retries (Phase 4b) and can't afford another -
+        // don't reset the board, just let them stop and think instead of
+        // burning another guess.
+        toast.error(`Out of free retries for today — another guess costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        setStatusMessage("Out of free retries for today. Buy credits to keep guessing, or come back tomorrow.");
+        return;
+      }
       toast.error(
-        error.response?.data?.detail || error.response?.data?.message || "Failed to submit move."
+        detail?.detail || detail || error.response?.data?.message || "Failed to submit move."
       );
       setStatusMessage("Failed to submit your move. Please try again.");
       const revertChess = new Chess(confirmedFen);
@@ -442,6 +503,23 @@ export default function Puzzles() {
                   {statusMessage}
                 </div>
               )}
+
+              {/* Phase 5: ambient free-budget status - visible before the
+                  user runs out, not just after a 402. */}
+              {budgetStatus && (
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                  <span>
+                    {budgetStatus.skips.remaining_free > 0
+                      ? `${budgetStatus.skips.remaining_free} free skips left today`
+                      : `Out of free skips today — next one costs ${budgetStatus.skips.cost ?? "?"} credits`}
+                  </span>
+                  <span>
+                    {budgetStatus.retries.remaining_free > 0
+                      ? `${budgetStatus.retries.remaining_free} free wrong guesses left today`
+                      : `Out of free retries today — the next wrong guess costs ${budgetStatus.retries.cost ?? "?"} credits`}
+                  </span>
+                </div>
+              )}
             </form>
           </section>
 
@@ -462,6 +540,42 @@ export default function Puzzles() {
                   <span className="font-semibold text-[#00FF94]">{progress?.earned_rating ?? 0}</span>
                 </div>
               </div>
+            </div>
+
+            <div className="rounded-3xl border border-hair bg-surface-1 p-6">
+              <div className="flex items-center justify-between gap-3 mb-3">
+                <h3 className="font-heading text-xl" style={{ color: "var(--text-primary)" }}>Puzzle Packs</h3>
+              </div>
+              <p className="text-sm mb-3" style={{ color: "var(--text-secondary)" }}>
+                Jump straight to a harder tier instead of grinding up to it. Tiers you've already earned are always free.
+              </p>
+              {packs?.length ? (
+                <div className="grid grid-cols-5 gap-2">
+                  {packs.map((pack) => (
+                    <button
+                      key={pack.difficulty}
+                      type="button"
+                      onClick={() => fetchPuzzle(pack.difficulty)}
+                      disabled={loading}
+                      title={pack.earned ? "Earned" : pack.unlocked ? "Unlocked" : `${pack.cost ?? "?"} credits to unlock`}
+                      className={`rounded-lg border p-2 text-center text-sm font-semibold transition ${
+                        puzzle?.difficulty === pack.difficulty
+                          ? "border-[#D4AF37] bg-[#D4AF37]/10 text-[#D4AF37]"
+                          : pack.earned || pack.unlocked
+                          ? "border-hair bg-surface-2 hover:bg-surface-3"
+                          : "border-hair bg-surface-2 text-text-secondary hover:bg-surface-3"
+                      }`}
+                    >
+                      {pack.difficulty}
+                      {!pack.earned && !pack.unlocked && (
+                        <div className="text-[10px] font-normal mt-0.5">{pack.cost ?? "—"}c</div>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm" style={{ color: "var(--text-secondary)" }}>Loading packs...</p>
+              )}
             </div>
 
             <div className="rounded-3xl border border-hair bg-surface-1 p-6">

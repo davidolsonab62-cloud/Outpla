@@ -2,11 +2,21 @@ import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
 } from "@/components/ui/dialog";
 import { useAuth, API } from "@/App";
 import { toast } from "sonner";
@@ -26,10 +36,14 @@ import {
   Share2,
   Link2,
   MessageCircle,
+  Plus,
+  Lock,
 } from "lucide-react";
 import { SkeletonPanel } from "@/components/ui/skeletons";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || window.location.origin;
+
+const PRIVATE_TOURNAMENT_TIME_CONTROLS = ["3+2", "5+0", "10+0", "15+10", "30+0"];
 
 
 function CountdownTimer({ targetTime, expiredText = "Starting..." }) {
@@ -68,7 +82,7 @@ function CountdownTimer({ targetTime, expiredText = "Starting..." }) {
 }
 
 export default function Tournaments() {
-  const { user, token } = useAuth();
+  const { user, token, refreshUser } = useAuth();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [tournaments, setTournaments] = useState([]);
@@ -79,6 +93,25 @@ export default function Tournaments() {
   const [leaderboardTournament, setLeaderboardTournament] = useState(null);
   const [joining, setJoining] = useState(false);
   const [leavingId, setLeavingId] = useState(null);
+
+  // Phase 4c: create-your-own private tournament, gated behind credits.
+  const [createPrivateOpen, setCreatePrivateOpen] = useState(false);
+  const [creatingPrivate, setCreatingPrivate] = useState(false);
+  // Phase 5: show cost before the user commits.
+  const [privateTournamentCost, setPrivateTournamentCost] = useState(null);
+
+  useEffect(() => {
+    if (!token) return;
+    axios
+      .get(`${API}/credits/feature-costs/private_tournament_create`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => setPrivateTournamentCost(response.data.cost))
+      .catch(() => {});
+  }, [token]);
+  const [privateName, setPrivateName] = useState("");
+  const [privateTimeControl, setPrivateTimeControl] = useState("5+0");
+  const [privateMinPlayers, setPrivateMinPlayers] = useState("2");
+  const [privateMaxPlayers, setPrivateMaxPlayers] = useState("16");
+  const [privateDuration, setPrivateDuration] = useState("60");
 
   useEffect(() => {
     fetchTournaments();
@@ -242,6 +275,51 @@ export default function Tournaments() {
     }
   };
 
+  // Phase 4c: any logged-in user can create their own private tournament,
+  // gated behind credits (see server.py's /tournaments/private). Success
+  // shows the invite link/code so the creator can share it, and refreshUser()
+  // so the header credits balance updates immediately after the spend.
+  const handleCreatePrivateTournament = async () => {
+    if (!privateName.trim()) {
+      toast.error("Give your tournament a name");
+      return;
+    }
+    setCreatingPrivate(true);
+    try {
+      const response = await axios.post(
+        `${API}/tournaments/private`,
+        {
+          name: privateName.trim(),
+          time_control: privateTimeControl,
+          min_players: parseInt(privateMinPlayers, 10) || 2,
+          max_players: parseInt(privateMaxPlayers, 10) || 16,
+          tournament_type: "arena",
+          duration_minutes: parseInt(privateDuration, 10) || 60,
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      toast.success(`"${response.data.name}" created — invite code: ${response.data.invite_code}`);
+      refreshUser();
+      setCreatePrivateOpen(false);
+      setPrivateName("");
+      fetchTournaments();
+      if (token) fetchMyTournaments();
+      setActiveTab("mine");
+    } catch (error) {
+      console.error("Create private tournament error", error);
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        toast.error(`Not enough credits — creating a private tournament costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        return;
+      }
+      toast.error(typeof detail === "string" ? detail : "Failed to create tournament");
+    } finally {
+      setCreatingPrivate(false);
+    }
+  };
+
   const getTypeIcon = (type) => {
     switch (type) {
       case "arena":
@@ -357,6 +435,112 @@ export default function Tournaments() {
               <Badge className="bg-surface-1 text-ink border-hair">{myTournaments.length}</Badge>
             )}
           </Button>
+          {token && (
+            <Dialog open={createPrivateOpen} onOpenChange={setCreatePrivateOpen}>
+              <DialogTrigger asChild>
+                <Button
+                  variant="outline"
+                  className="uppercase tracking-wider font-bold bg-transparent border border-hair text-ink-secondary hover:bg-surface-2 flex items-center gap-2"
+                  data-testid="create-private-tournament-btn"
+                >
+                  <Plus className="w-4 h-4" />
+                  Create private
+                </Button>
+              </DialogTrigger>
+              <DialogContent
+                className="max-w-md"
+                style={{ background: "var(--surface-1)", borderColor: "var(--hairline)", color: "var(--text-primary)" }}
+              >
+                <DialogHeader>
+                  <DialogTitle style={{ fontFamily: "'Space Grotesk', sans-serif" }} className="flex items-center gap-2">
+                    <Lock className="w-4 h-4 text-brand" />
+                    Create private tournament
+                  </DialogTitle>
+                </DialogHeader>
+                <div className="space-y-4 pt-2">
+                  <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
+                    Costs credits to create. You'll get an invite code to share — friends join with it, no one else sees it in the public list.
+                  </p>
+                  <div className="space-y-2">
+                    <Label style={{ color: "var(--text-secondary)" }}>Name</Label>
+                    <Input
+                      value={privateName}
+                      onChange={(e) => setPrivateName(e.target.value)}
+                      placeholder="Friday Night Blitz"
+                      style={{ background: "var(--surface-2)", borderColor: "var(--hairline)", color: "var(--text-primary)" }}
+                      data-testid="private-tournament-name-input"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label style={{ color: "var(--text-secondary)" }}>Time control</Label>
+                    <Select value={privateTimeControl} onValueChange={setPrivateTimeControl}>
+                      <SelectTrigger
+                        style={{ background: "var(--surface-2)", borderColor: "var(--hairline)", color: "var(--text-primary)" }}
+                        data-testid="private-tournament-time-control-select"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent style={{ background: "var(--surface-1)", borderColor: "var(--hairline)" }}>
+                        {PRIVATE_TOURNAMENT_TIME_CONTROLS.map((tc) => (
+                          <SelectItem key={tc} value={tc}>{tc}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-2">
+                      <Label style={{ color: "var(--text-secondary)" }}>Min players</Label>
+                      <Input
+                        type="number"
+                        min="2"
+                        value={privateMinPlayers}
+                        onChange={(e) => setPrivateMinPlayers(e.target.value)}
+                        className="font-mono"
+                        style={{ background: "var(--surface-2)", borderColor: "var(--hairline)", color: "var(--text-primary)" }}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label style={{ color: "var(--text-secondary)" }}>Max players</Label>
+                      <Input
+                        type="number"
+                        min="2"
+                        value={privateMaxPlayers}
+                        onChange={(e) => setPrivateMaxPlayers(e.target.value)}
+                        className="font-mono"
+                        style={{ background: "var(--surface-2)", borderColor: "var(--hairline)", color: "var(--text-primary)" }}
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label style={{ color: "var(--text-secondary)" }}>Duration (minutes)</Label>
+                    <Input
+                      type="number"
+                      min="1"
+                      value={privateDuration}
+                      onChange={(e) => setPrivateDuration(e.target.value)}
+                      className="font-mono"
+                      style={{ background: "var(--surface-2)", borderColor: "var(--hairline)", color: "var(--text-primary)" }}
+                    />
+                  </div>
+                  <Button
+                    onClick={handleCreatePrivateTournament}
+                    disabled={creatingPrivate}
+                    className="w-full bg-brand text-brand-on hover:bg-brand-hover font-bold uppercase tracking-wider"
+                    data-testid="confirm-create-private-tournament-btn"
+                  >
+                    {creatingPrivate ? (
+                      <span className="flex items-center gap-2 justify-center">
+                        <div className="w-4 h-4 spinner" />
+                        Creating...
+                      </span>
+                    ) : (
+                      `Create tournament${privateTournamentCost != null ? ` (${privateTournamentCost} cr)` : ""}`
+                    )}
+                  </Button>
+                </div>
+              </DialogContent>
+            </Dialog>
+          )}
         </div>
 
         {loading ? (

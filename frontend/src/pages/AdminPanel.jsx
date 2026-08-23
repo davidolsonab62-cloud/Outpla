@@ -61,6 +61,9 @@ export default function AdminPanel() {
   const [securityAlerts, setSecurityAlerts] = useState([]);
   const [tournaments, setTournaments] = useState([]);
   const [withdrawals, setWithdrawals] = useState([]);
+  const [creditCosts, setCreditCosts] = useState([]);
+  const [editedCosts, setEditedCosts] = useState({});
+  const [savingCostKey, setSavingCostKey] = useState(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState("overview");
 
@@ -103,7 +106,7 @@ export default function AdminPanel() {
 
   const fetchAdminData = async () => {
     try {
-      const [statsRes, usersRes, settingsRes, flaggedRes, alertsRes, tournamentsRes, withdrawalsRes] = await Promise.all([
+      const [statsRes, usersRes, settingsRes, flaggedRes, alertsRes, tournamentsRes, withdrawalsRes, creditCostsRes] = await Promise.all([
         axios.get(`${API}/admin/stats`, { headers: { Authorization: `Bearer ${token}` } }),
         axios.get(`${API}/admin/users`, { headers: { Authorization: `Bearer ${token}` } }),
         axios.get(`${API}/admin/settings`, { headers: { Authorization: `Bearer ${token}` } }),
@@ -111,6 +114,7 @@ export default function AdminPanel() {
         axios.get(`${API}/admin/security-alerts`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: [] })),
         axios.get(`${API}/tournaments`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: [] })),
         axios.get(`${API}/admin/withdrawals`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: [] })),
+        axios.get(`${API}/admin/credit-feature-costs`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: [] })),
       ]);
 
       setStats(statsRes.data);
@@ -120,6 +124,7 @@ export default function AdminPanel() {
       setSecurityAlerts(alertsRes.data);
       setTournaments(tournamentsRes.data);
       setWithdrawals(withdrawalsRes.data);
+      setCreditCosts(creditCostsRes.data);
       setNewArbiterFee((settingsRes.data.arbiter_fee * 100).toString());
     } catch (error) {
       console.error("Failed to fetch admin data:", error);
@@ -246,6 +251,34 @@ export default function AdminPanel() {
     }
   };
 
+  const handleSaveCreditCost = async (feature_key, category) => {
+    const raw = editedCosts[feature_key];
+    const cost = parseInt(raw, 10);
+    if (Number.isNaN(cost) || cost < 0) {
+      toast.error("Cost must be a whole number, 0 or greater");
+      return;
+    }
+    setSavingCostKey(feature_key);
+    try {
+      await axios.put(
+        `${API}/admin/credit-feature-costs/${feature_key}`,
+        { cost, category: category || null },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      toast.success(`${feature_key} cost updated`);
+      setEditedCosts((prev) => {
+        const next = { ...prev };
+        delete next[feature_key];
+        return next;
+      });
+      fetchAdminData();
+    } catch (error) {
+      toast.error("Failed to update cost");
+    } finally {
+      setSavingCostKey(null);
+    }
+  };
+
   const handleCreateTournament = async () => {
     try {
       await axios.post(
@@ -325,6 +358,7 @@ export default function AdminPanel() {
             { id: "withdrawals", label: "Withdrawals", icon: Wallet, badge: pendingWithdrawalsCount },
             { id: "anticheat", label: "Anti-Cheat", icon: Shield },
             { id: "tournaments", label: "Tournaments", icon: Calendar },
+            { id: "credits", label: "Credits", icon: DollarSign },
             { id: "settings", label: "Settings", icon: Settings },
           ].map((tab) => (
             <button
@@ -802,6 +836,81 @@ export default function AdminPanel() {
         )}
 
         {/* Settings Tab */}
+        {activeTab === "credits" && (
+          <div>
+            <h2 className="font-display font-bold text-2xl text-ink mb-2">
+              Credit Feature Costs
+            </h2>
+            <p className="text-ink-muted text-sm mb-6">
+              Costs apply immediately - no deploy needed. A feature stays blocked (500 on spend) until it has a
+              cost here.
+            </p>
+
+            <div className="bg-surface-1 border border-hair rounded-sm">
+              <Table className="min-w-[560px]">
+                <TableHeader>
+                  <TableRow className="border-hair hover:bg-transparent">
+                    <TableHead className="text-ink-secondary">Feature key</TableHead>
+                    <TableHead className="text-ink-secondary">Category</TableHead>
+                    <TableHead className="text-ink-secondary text-center">Cost (credits)</TableHead>
+                    <TableHead className="text-ink-secondary text-right">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {creditCosts.map((c) => {
+                    const isEdited = editedCosts[c.feature_key] !== undefined;
+                    const displayValue = isEdited ? editedCosts[c.feature_key] : String(c.cost);
+                    return (
+                      <TableRow key={c.feature_key} className="border-hair hover:bg-surface-2">
+                        <TableCell className="font-mono text-ink">{c.feature_key}</TableCell>
+                        <TableCell className="text-ink-secondary">
+                          {c.category ? (
+                            <Badge className="bg-brand-dim text-brand border-brand">{c.category}</Badge>
+                          ) : (
+                            <span className="text-ink-muted">—</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-center">
+                          <Input
+                            type="number"
+                            min="0"
+                            step="1"
+                            value={displayValue}
+                            onChange={(e) =>
+                              setEditedCosts((prev) => ({ ...prev, [c.feature_key]: e.target.value }))
+                            }
+                            className="bg-surface-2 border-hair text-ink font-mono text-center w-24 mx-auto"
+                            data-testid={`credit-cost-input-${c.feature_key}`}
+                          />
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Button
+                            onClick={() => handleSaveCreditCost(c.feature_key, c.category)}
+                            disabled={!isEdited || savingCostKey === c.feature_key}
+                            variant="ghost"
+                            size="sm"
+                            className="text-ink-secondary hover:text-brand"
+                            data-testid={`credit-cost-save-${c.feature_key}`}
+                          >
+                            {savingCostKey === c.feature_key ? "Saving…" : "Save"}
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                  {creditCosts.length === 0 && (
+                    <TableRow className="border-hair hover:bg-transparent">
+                      <TableCell colSpan={4} className="text-center text-ink-muted py-8">
+                        No feature costs configured yet.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+        )}
+
         {activeTab === "settings" && (
           <div>
             <h2 className="font-display font-bold text-2xl text-ink mb-6">

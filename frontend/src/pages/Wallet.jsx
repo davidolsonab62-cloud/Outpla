@@ -29,6 +29,7 @@ import {
   Check,
   QrCode,
   AlertTriangle,
+  Coins,
 } from "lucide-react";
 import { SkeletonPanel } from "@/components/ui/skeletons";
 import PageHeader from "@/components/layout/PageHeader";
@@ -71,9 +72,16 @@ export default function Wallet() {
   const [withdrawMethod] = useState("crypto");
   const [withdrawing, setWithdrawing] = useState(false);
 
+  const [buyCreditsDialogOpen, setBuyCreditsDialogOpen] = useState(false);
+  const [creditPacks, setCreditPacks] = useState([]);
+  const [selectedPackAmount, setSelectedPackAmount] = useState(null);
+  const [customUsdtAmount, setCustomUsdtAmount] = useState("");
+  const [buyingCredits, setBuyingCredits] = useState(false);
+
   useEffect(() => {
     fetchTransactions();
     fetchWithdrawals();
+    fetchCreditPacks();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -98,6 +106,58 @@ export default function Wallet() {
       setWithdrawals(response.data);
     } catch (error) {
       console.error("Failed to fetch withdrawals:", error);
+    }
+  };
+
+  const fetchCreditPacks = async () => {
+    try {
+      const response = await axios.get(`${API}/credits/packs`);
+      setCreditPacks(response.data.packs || []);
+      if (response.data.packs?.length) {
+        setSelectedPackAmount(response.data.packs[0].amount_usdt);
+      }
+    } catch (error) {
+      console.error("Failed to fetch credit packs:", error);
+    }
+  };
+
+  const buyCreditsUsdtAmount = customUsdtAmount
+    ? parseFloat(customUsdtAmount)
+    : selectedPackAmount;
+
+  const handleBuyCredits = async () => {
+    const amount = buyCreditsUsdtAmount;
+    if (!amount || amount <= 0) {
+      toast.error("Enter a valid amount");
+      return;
+    }
+    if (amount > (user?.wallet_balance?.USDT || 0)) {
+      toast.error("Insufficient USDT balance");
+      return;
+    }
+
+    setBuyingCredits(true);
+    try {
+      const response = await axios.post(
+        `${API}/credits/purchase`,
+        { amount_usdt: amount },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      updateUser({
+        ...user,
+        wallet_balance: response.data.wallet_balance,
+        credits_balance: response.data.credits_balance,
+      });
+
+      toast.success(`Purchased ${response.data.credits_purchased.toLocaleString()} credits`);
+      setBuyCreditsDialogOpen(false);
+      setCustomUsdtAmount("");
+      fetchTransactions();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || "Purchase failed");
+    } finally {
+      setBuyingCredits(false);
     }
   };
 
@@ -148,12 +208,20 @@ export default function Wallet() {
 
   const getCurrencyInfo = (currency) => CURRENCIES.find((c) => c.value === currency) || CURRENCIES[0];
 
+  const TX_TYPE_LABELS = {
+    credits_purchase: "Credits purchase",
+    credits_purchase_refund: "Purchase refund",
+  };
+  const getTransactionLabel = (type) => TX_TYPE_LABELS[type] || type;
+
   const getTransactionIcon = (type) => {
     switch (type) {
       case "deposit":
       case "win":
+      case "credits_purchase_refund":
         return <ArrowDownLeft className="w-4 h-4" style={{ color: "var(--green)" }} />;
       case "withdraw":
+      case "credits_purchase":
         return <ArrowUpRight className="w-4 h-4" style={{ color: "var(--red)" }} />;
       case "stake":
         return <WalletIcon className="w-4 h-4" style={{ color: "var(--orange)" }} />;
@@ -192,6 +260,108 @@ export default function Wallet() {
             </div>
           );
         })}
+      </div>
+
+      {/* Credits balance */}
+      <div
+        className="rounded-2xl p-5 mb-6 flex items-center justify-between"
+        style={{ background: "var(--surface-1)", border: "1px solid var(--hairline)" }}
+        data-testid="balance-credits"
+      >
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-[9px] flex items-center justify-center" style={{ background: "var(--surface-2)" }}>
+            <Coins className="w-5 h-5" style={{ color: "var(--gold, var(--brand))" }} />
+          </div>
+          <div>
+            <span className="text-xs uppercase tracking-wide font-semibold" style={{ color: "var(--text-secondary)" }}>
+              Credits
+            </span>
+            <p className="font-mono text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>
+              {(user?.credits_balance || 0).toLocaleString()}
+            </p>
+          </div>
+        </div>
+        <Dialog open={buyCreditsDialogOpen} onOpenChange={setBuyCreditsDialogOpen}>
+          <DialogTrigger asChild>
+            <Button className="font-semibold px-6" style={{ background: "var(--brand)", color: "var(--on-brand)" }} data-testid="buy-credits-btn">
+              Buy credits
+            </Button>
+          </DialogTrigger>
+          <DialogContent
+            className="max-w-md"
+            style={{ background: "var(--surface-1)", borderColor: "var(--hairline)", color: "var(--text-primary)" }}
+          >
+            <DialogHeader>
+              <DialogTitle style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Buy credits</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-5 pt-4">
+              <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                100 credits = $1. Paid from your USDT balance. Credits are separate from your wallet and can&apos;t be
+                withdrawn, transferred, or used for staked games.
+              </p>
+
+              <div className="space-y-2">
+                <Label style={{ color: "var(--text-secondary)" }}>Choose a pack</Label>
+                <div className="grid grid-cols-3 gap-2">
+                  {creditPacks.map((pack) => (
+                    <button
+                      key={pack.amount_usdt}
+                      type="button"
+                      onClick={() => {
+                        setSelectedPackAmount(pack.amount_usdt);
+                        setCustomUsdtAmount("");
+                      }}
+                      className="rounded-lg py-3 text-center"
+                      style={{
+                        background: !customUsdtAmount && selectedPackAmount === pack.amount_usdt ? "var(--brand)" : "var(--surface-2)",
+                        color: !customUsdtAmount && selectedPackAmount === pack.amount_usdt ? "var(--on-brand)" : "var(--text-primary)",
+                        border: "1px solid var(--hairline)",
+                      }}
+                      data-testid={`credit-pack-${pack.amount_usdt}`}
+                    >
+                      <p className="font-mono font-bold text-sm">{pack.credits.toLocaleString()}</p>
+                      <p className="text-[11px]" style={{ opacity: 0.8 }}>${pack.amount_usdt}</p>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label style={{ color: "var(--text-secondary)" }}>Or enter a custom USDT amount</Label>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={customUsdtAmount}
+                  onChange={(e) => setCustomUsdtAmount(e.target.value)}
+                  placeholder="0.00"
+                  className="font-mono"
+                  style={{ background: "var(--surface-2)", borderColor: "var(--hairline)", color: "var(--text-primary)" }}
+                  data-testid="custom-credits-amount-input"
+                />
+                <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                  {buyCreditsUsdtAmount > 0
+                    ? `= ${Math.floor(buyCreditsUsdtAmount * 100).toLocaleString()} credits`
+                    : "Enter an amount to see credits"}
+                </p>
+              </div>
+
+              <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                Available: {(user?.wallet_balance?.USDT || 0).toFixed(2)} USDT
+              </p>
+
+              <Button
+                onClick={handleBuyCredits}
+                disabled={buyingCredits}
+                className="w-full font-semibold"
+                style={{ background: "var(--brand)", color: "var(--on-brand)" }}
+                data-testid="confirm-buy-credits-btn"
+              >
+                {buyingCredits ? "Processing\u2026" : "Buy credits"}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
       </div>
 
       {/* Actions */}
@@ -444,7 +614,7 @@ export default function Wallet() {
               </div>
             ) : (
               transactions.map((tx) => {
-                const isPositive = tx.tx_type === "deposit" || tx.tx_type === "win" || tx.tx_type === "refund";
+                const isPositive = tx.tx_type === "deposit" || tx.tx_type === "win" || tx.tx_type === "refund" || tx.tx_type === "credits_purchase_refund";
                 return (
                   <div key={tx.tx_id} className="flex items-center justify-between px-5 py-3.5" style={{ borderTop: "1px solid var(--hairline)" }} data-testid={`tx-${tx.tx_id}`}>
                     <div className="flex items-center gap-3.5">
@@ -452,7 +622,7 @@ export default function Wallet() {
                         {getTransactionIcon(tx.tx_type)}
                       </div>
                       <div>
-                        <p className="capitalize text-[14px] font-semibold">{tx.tx_type}</p>
+                        <p className="capitalize text-[14px] font-semibold">{getTransactionLabel(tx.tx_type)}</p>
                         <p className="text-sm" style={{ color: "var(--text-secondary)" }}>{new Date(tx.created_at).toLocaleDateString()}</p>
                       </div>
                     </div>

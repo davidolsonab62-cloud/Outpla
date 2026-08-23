@@ -42,6 +42,7 @@ import Terms from "@/pages/Terms";
 import Privacy from "@/pages/Privacy";
 import DatabaseInfo from "@/pages/Database";
 import Support from "@/pages/Support";
+import OpeningExplorer from "@/pages/OpeningExplorer";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || window.location.origin;
 export const API = `${BACKEND_URL}/api`;
@@ -160,6 +161,31 @@ export const AuthProvider = ({ children }) => {
       refreshPuzzleProgress();
     }
   }, [user, token, refreshPendingChallenges, refreshWatchableMatches, refreshPuzzleProgress]);
+
+  // Silently keep the user's stored IANA timezone in sync with the
+  // browser's - used server-side to localize daily-reset features like
+  // puzzle retry/skip budgets (Phase 4b) to the user's actual midnight
+  // instead of UTC. Fire-and-forget: never blocks the UI, never surfaces
+  // an error, and only writes when it's actually stale so it's not a
+  // network call on every load.
+  useEffect(() => {
+    if (!user || !token) return;
+    let detected;
+    try {
+      detected = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    } catch (error) {
+      return;
+    }
+    if (!detected || detected === user.timezone) return;
+    axios
+      .put(
+        `${API}/users/${user.user_id}/settings`,
+        { timezone: detected },
+        { headers: { Authorization: `Bearer ${token}` }, withCredentials: true }
+      )
+      .then(() => setUser((prev) => (prev ? { ...prev, timezone: detected } : prev)))
+      .catch((error) => console.warn("Failed to sync timezone", error));
+  }, [user, token]);
 
   const navigate = useNavigate();
 
@@ -606,6 +632,14 @@ function AppRouter() {
           element={
             <ProtectedRoute>
               <ImportPGN />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/opening-explorer"
+          element={
+            <ProtectedRoute>
+              <OpeningExplorer />
             </ProtectedRoute>
           }
         />

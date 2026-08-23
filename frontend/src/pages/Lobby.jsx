@@ -36,6 +36,7 @@ import {
   Check,
   Play,
   Radio,
+  Rocket,
 } from "lucide-react";
 import { SkeletonStatsRow, SkeletonPanel } from "@/components/ui/skeletons";
 import PageHeader from "@/components/layout/PageHeader";
@@ -75,11 +76,23 @@ export default function Lobby() {
   const [playDialogOpen, setPlayDialogOpen] = useState(false);
   const [streamDialogOpen, setStreamDialogOpen] = useState(false);
   const [joiningGame, setJoiningGame] = useState(null);
+  const [boostingGame, setBoostingGame] = useState(null);
   const [currentGameId, setCurrentGameId] = useState(null);
   const [currentGameExpiry, setCurrentGameExpiry] = useState(null);
   const [expiryCountdown, setExpiryCountdown] = useState(0);
   const [savedComputerMatch, setSavedComputerMatch] = useState(null);
   const [computerMatchCountdown, setComputerMatchCountdown] = useState(0);
+  // Phase 5: show the boost cost before the user commits, not just after
+  // a 402 (see the insufficient_credits handling in boostGame below).
+  const [boostCost, setBoostCost] = useState(null);
+
+  useEffect(() => {
+    if (!token) return;
+    axios
+      .get(`${API}/credits/feature-costs/featured_game`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => setBoostCost(response.data.cost))
+      .catch(() => {});
+  }, [token]);
 
 
   // Create game form
@@ -323,6 +336,35 @@ export default function Lobby() {
       setJoiningGame(null);
     }
   };
+
+  // Phase 4c: pay credits to feature an open game at the top of the lobby.
+  // Only the game's own creator can boost it, and only while it's still
+  // waiting for an opponent - fetchGames()/refreshUser() afterwards so both
+  // the "Featured" badge and the header credits balance update immediately.
+  const boostGame = async (gameId) => {
+    setBoostingGame(gameId);
+    try {
+      await axios.post(`${API}/games/${gameId}/boost`, {}, { headers: { Authorization: `Bearer ${token}` } });
+      toast.success("Game boosted to the top of the lobby");
+      fetchGames();
+      refreshUser();
+    } catch (error) {
+      console.error("Boost game error", error);
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        toast.error(`Not enough credits — boosting costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+      } else {
+        toast.error(detail || "Failed to boost game");
+      }
+    } finally {
+      setBoostingGame(null);
+    }
+  };
+
+  const isGameFeaturedNow = (game) =>
+    Boolean(game.featured && game.featured_until && new Date(game.featured_until) > new Date());
 
   const getGameTypeIcon = (type) => {
     switch (type) {
@@ -715,6 +757,34 @@ export default function Lobby() {
                       )}
 
                       <div className="flex items-center gap-2 flex-wrap">
+                        {isGameFeaturedNow(game) ? (
+                          <div
+                            className="px-3.5 py-2 rounded-lg flex items-center gap-1.5"
+                            style={{ background: "var(--brand-dim, rgba(212,175,55,0.12))", border: "1px solid var(--brand, #D4AF37)" }}
+                            title="Featured at the top of the lobby"
+                          >
+                            <Rocket className="w-3.5 h-3.5" style={{ color: "var(--brand, #D4AF37)" }} />
+                            <span className="text-xs font-semibold" style={{ color: "var(--brand, #D4AF37)" }}>Featured</span>
+                          </div>
+                        ) : (
+                          isWaiting &&
+                          game.white_player?.user_id === user?.user_id && (
+                            <Button
+                              variant="outline"
+                              onClick={() => boostGame(game.game_id)}
+                              disabled={boostingGame === game.game_id}
+                              className="font-semibold"
+                              style={{ borderColor: "var(--hairline)", color: "var(--text-primary)" }}
+                              title={boostCost != null ? `Feature this game at the top of the lobby — ${boostCost} credits` : "Feature this game at the top of the lobby"}
+                              data-testid={`boost-game-btn-${game.game_id}`}
+                            >
+                              <Rocket className="w-4 h-4 mr-1" />
+                              {boostingGame === game.game_id
+                                ? "\u2026"
+                                : `Boost${boostCost != null ? ` (${boostCost} cr)` : ""}`}
+                            </Button>
+                          )
+                        )}
                         <Button
                           variant="outline"
                           onClick={() => shareMatchLink(game.game_id, "Match")}

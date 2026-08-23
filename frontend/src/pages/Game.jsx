@@ -31,6 +31,7 @@ import {
   VolumeX,
   Smartphone,
   Settings,
+  RotateCcw,
 } from "lucide-react";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import {
@@ -43,10 +44,15 @@ import { resolveBoardPrefs } from "@/utils/boardPrefs";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || window.location.origin;
 
+// Phase 4e: mirrors EXTRA_TIME_SECONDS on the backend - display only, so
+// the button label matches what /games/{id}/add-time actually applies.
+// The backend value is always authoritative.
+const EXTRA_TIME_SECONDS_DISPLAY = 60;
+
 export default function Game() {
   const { gameId } = useParams();
   const location = useLocation();
-  const { user, token } = useAuth();
+  const { user, token, refreshUser } = useAuth();
   const navigate = useNavigate();
   const searchParams = new URLSearchParams(location.search);
   const reviewMode = searchParams.get("review") === "true";
@@ -139,6 +145,9 @@ export default function Game() {
   const [analysis, setAnalysis] = useState(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
+  const [deepAnalysis, setDeepAnalysis] = useState(null);
+  const [deepAnalysisLoading, setDeepAnalysisLoading] = useState(false);
+  const [deepAnalysisError, setDeepAnalysisError] = useState(null);
 
   // Sound and vibration settings
   const [settings, setSettings] = useState(() => getSettings());
@@ -247,7 +256,19 @@ export default function Game() {
       }
     } catch (error) {
       console.warn("Analysis fetch failed:", error);
-      const message = error?.response?.data?.detail || error?.response?.data?.error || error?.message || "Stockfish analysis unavailable";
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        toast.error(`Not enough credits — the game review costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        setAnalysisError("insufficient_credits");
+        setAnalysis(null);
+        analysisDoneRef.current = true; // definitive answer - don't auto-retry a paywall
+        analysisLoadingRef.current = false;
+        setAnalysisLoading(false);
+        return;
+      }
+      const message = detail?.detail || detail || error?.response?.data?.error || error?.message || "Stockfish analysis unavailable";
       setAnalysisError(message);
       setAnalysis(null);
       // don't set analysisDoneRef here — let the user retry via the Refresh button
@@ -256,6 +277,39 @@ export default function Game() {
       setAnalysisLoading(false);
     }
   }, [gameId, token]);
+
+  // Deep/cloud re-analysis (depth 20) of one of the user's own completed
+  // games - a separate paid unlock from the standard review above (Phase
+  // 4a). Unlike fetchAnalysis, this always POSTs: the endpoint itself is
+  // idempotent (no second charge if already unlocked) and returns the
+  // result directly, so there's no separate "check first" GET needed here.
+  const runDeepAnalysis = useCallback(async () => {
+    if (!gameId || !token) return;
+    setDeepAnalysisLoading(true);
+    setDeepAnalysisError(null);
+    try {
+      const response = await axios.post(
+        `${API}/games/${gameId}/deep-analysis`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setDeepAnalysis(response.data.analysis);
+    } catch (error) {
+      console.warn("Deep analysis failed:", error);
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        toast.error(`Not enough credits — deep analysis costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        setDeepAnalysisError("insufficient_credits");
+      } else {
+        const message = detail?.detail || detail || error?.message || "Deep analysis unavailable";
+        setDeepAnalysisError(message);
+      }
+    } finally {
+      setDeepAnalysisLoading(false);
+    }
+  }, [gameId, token, navigate]);
 
   const fetchGame = useCallback(async () => {
     if (isImportedPgn) {
@@ -604,6 +658,41 @@ export default function Game() {
       if (data.game_id === gameId) {
         setDrawOffer(null);
         toast("Draw offer cancelled", { duration: 2000 });
+      }
+    });
+
+    // Phase 4e: a takeback_token was spent - sync both boards to the
+    // restored position/turn/clocks. Mirrors move_made's state shape so
+    // the same chess.js reload logic applies.
+    socketRef.current.on("takeback_applied", (data) => {
+      if (data.game_id === gameId && !isReplayMode) {
+        try {
+          const chess = new Chess();
+          chess.load(data.fen);
+          flushSync(() => {
+            setChessInstance(chess);
+            setPosition(data.fen);
+            setMoveHistory(data.moves || []);
+            setCurrentMoveIndex((data.moves?.length || 0) - 1);
+            setGame((prev) => ({ ...prev, fen: data.fen, current_turn: data.current_turn }));
+            if (data.white_time !== undefined) setWhiteTime(data.white_time);
+            if (data.black_time !== undefined) setBlackTime(data.black_time);
+            setLastMove(null);
+          });
+          toast.info(data.by === user?.user_id ? "Move taken back" : "Opponent took back their last move", { duration: 3000 });
+        } catch (error) {
+          console.error("Error processing takeback_applied event:", error);
+        }
+      }
+    });
+
+    // Phase 4e: an extra_time purchase landed on one side's clock.
+    socketRef.current.on("clock_time_added", (data) => {
+      if (data.game_id === gameId) {
+        if (data.white_time !== undefined) setWhiteTime(data.white_time);
+        if (data.black_time !== undefined) setBlackTime(data.black_time);
+        const who = data.by === user?.user_id ? "You" : "Opponent";
+        toast.info(`${who} added ${data.seconds_added}s to the ${data.color} clock`, { duration: 3000 });
       }
     });
 
@@ -1263,6 +1352,148 @@ export default function Game() {
 
   const isTournamentMatch = !!game?.tournament_id;
 
+  // Phase 4c: spend a "rematch token" to instantly re-challenge the
+  // opponent from a just-finished CASUAL game. Server structurally blocks
+  // this for staked games (stake_amount > 0), so the button only ever
+  // shows for casual ones. Creates a fresh challenge the opponent still
+  // has to accept - navigate to the queue/lobby rather than the new game
+  // directly, since it isn't live until they do.
+  const [rematchLoading, setRematchLoading] = useState(false);
+  const [rematchSent, setRematchSent] = useState(false);
+  const [rematchCost, setRematchCost] = useState(null);
+  const [deepAnalysisCost, setDeepAnalysisCost] = useState(null);
+
+  // Phase 5: show cost before the user commits, for the two Phase 4a/4c
+  // gated actions on this page that are a discrete opt-in button click
+  // (unlike the standard review, which auto-fetches once per game and is
+  // idempotently free after the first view - there's no separate "commit"
+  // moment to show a price ahead of).
+  useEffect(() => {
+    if (!token) return;
+    axios
+      .get(`${API}/credits/feature-costs/rematch_token`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => setRematchCost(response.data.cost))
+      .catch(() => {});
+    axios
+      .get(`${API}/credits/feature-costs/deep_analysis`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => setDeepAnalysisCost(response.data.cost))
+      .catch(() => {});
+  }, [token]);
+
+  const requestRematch = useCallback(async () => {
+    if (!gameId) return;
+    setRematchLoading(true);
+    try {
+      await axios.post(`${API}/games/${gameId}/rematch`, {}, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      toast.success("Rematch challenge sent");
+      setRematchSent(true);
+      refreshUser();
+    } catch (error) {
+      console.error("Rematch request failed", error);
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        toast.error(`Not enough credits — a rematch token costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        return;
+      }
+      toast.error(typeof detail === "string" ? detail : "Failed to send rematch challenge");
+    } finally {
+      setRematchLoading(false);
+    }
+  }, [gameId, token, navigate, refreshUser]);
+
+  // Phase 4e: takeback/extra-time. Casual (unstaked) games only, per the
+  // spec's literal "stake_amount == 0" reading - tournament games are NOT
+  // separately excluded (server enforces this structurally - see
+  // _require_casual_untracked_game); !game?.stake_amount below just keeps
+  // the buttons from showing where they'd always be rejected, same spirit
+  // as the rematch button above.
+  const [takebackLoading, setTakebackLoading] = useState(false);
+  const [addTimeLoading, setAddTimeLoading] = useState(false);
+  const [takebackCost, setTakebackCost] = useState(null);
+  const [extraTimeCost, setExtraTimeCost] = useState(null);
+
+  const canUseCasualUtility = !game?.stake_amount;
+
+  // Phase 5: show cost before the user commits, same as every other
+  // gated action - fetched once via the generic cost-preview endpoint
+  // rather than only surfacing the price after a 402.
+  useEffect(() => {
+    if (!token || !canUseCasualUtility) return;
+    axios
+      .get(`${API}/credits/feature-costs/takeback_token`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => setTakebackCost(response.data.cost))
+      .catch(() => {});
+    axios
+      .get(`${API}/credits/feature-costs/extra_time`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => setExtraTimeCost(response.data.cost))
+      .catch(() => {});
+  }, [token, canUseCasualUtility]);
+
+  // Only the player who just moved can take it back, and only before the
+  // opponent has replied - i.e. it's currently the OPPONENT's turn, not
+  // mine. Computed the same way the server does (current_turn is whoever
+  // moves next).
+  const canTakeback =
+    canUseCasualUtility &&
+    game?.status === "active" &&
+    moveHistory.length > 0 &&
+    playerColor &&
+    playerColor !== "spectator" &&
+    game?.current_turn &&
+    game.current_turn !== playerColor;
+
+  const requestTakeback = useCallback(async () => {
+    if (!gameId) return;
+    setTakebackLoading(true);
+    try {
+      await axios.post(`${API}/games/${gameId}/takeback`, {}, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      // server emits takeback_applied, which updates the board
+      refreshUser();
+    } catch (error) {
+      console.error("Takeback request failed", error);
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        toast.error(`Not enough credits — a takeback costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        return;
+      }
+      toast.error(typeof detail === "string" ? detail : "Failed to take back move");
+    } finally {
+      setTakebackLoading(false);
+    }
+  }, [gameId, token, navigate, refreshUser]);
+
+  const addExtraTime = useCallback(async () => {
+    if (!gameId) return;
+    setAddTimeLoading(true);
+    try {
+      await axios.post(`${API}/games/${gameId}/add-time`, {}, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      // server emits clock_time_added, which updates the clock
+      refreshUser();
+    } catch (error) {
+      console.error("Add time request failed", error);
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        toast.error(`Not enough credits — extra time costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        return;
+      }
+      toast.error(typeof detail === "string" ? detail : "Failed to add time");
+    } finally {
+      setAddTimeLoading(false);
+    }
+  }, [gameId, token, navigate, refreshUser]);
+
   // Once a tournament match ends, the result has already been recorded and
   // (for league tournaments) the player's next paired match is created
   // automatically server-side. Give them a moment to see the result, then
@@ -1665,7 +1896,7 @@ export default function Game() {
                           : "Your next paired match will appear automatically once it's ready."}
                       </p>
                     )}
-                    <div className="flex gap-3 justify-center">
+                    <div className="flex gap-3 justify-center flex-wrap">
                       <Button
                         onClick={enterReplayMode}
                         variant="outline"
@@ -1674,6 +1905,22 @@ export default function Game() {
                         <Play className="w-4 h-4 mr-2" />
                         Replay
                       </Button>
+                      {!isTournamentMatch && !game?.stake_amount && playerColor !== "spectator" && (
+                        <Button
+                          onClick={requestRematch}
+                          disabled={rematchLoading || rematchSent}
+                          variant="outline"
+                          className="bg-transparent border-hair text-ink hover:bg-surface-2"
+                          data-testid="rematch-btn"
+                        >
+                          <RotateCcw className="w-4 h-4 mr-2" />
+                          {rematchSent
+                            ? "Rematch sent"
+                            : rematchLoading
+                            ? "…"
+                            : `Rematch${rematchCost != null ? ` (${rematchCost} cr)` : ""}`}
+                        </Button>
+                      )}
                       {isTournamentMatch ? (
                         <Button
                           onClick={goToTournamentStandings}
@@ -1780,6 +2027,35 @@ export default function Game() {
                       className="bg-transparent border-yellow-400/20 text-yellow-300 hover:bg-yellow-400/10"
                     >
                       Cancel Draw
+                    </Button>
+                  )}
+
+                  {/* Phase 4e: takeback/extra-time - casual (unstaked)
+                      games only, tournament games included. Server
+                      structurally enforces this too; canUseCasualUtility
+                      just keeps the buttons from showing where they'd
+                      always be rejected. */}
+                  {canUseCasualUtility && canTakeback && (
+                    <Button
+                      onClick={requestTakeback}
+                      disabled={takebackLoading}
+                      variant="outline"
+                      className="bg-transparent border-hair text-ink hover:bg-surface-2"
+                    >
+                      <RotateCcw className="w-4 h-4 mr-2" />
+                      {takebackLoading ? "Taking back…" : `Takeback${takebackCost != null ? ` (${takebackCost} cr)` : ""}`}
+                    </Button>
+                  )}
+
+                  {canUseCasualUtility && (
+                    <Button
+                      onClick={addExtraTime}
+                      disabled={addTimeLoading}
+                      variant="outline"
+                      className="bg-transparent border-hair text-ink hover:bg-surface-2"
+                    >
+                      <Clock className="w-4 h-4 mr-2" />
+                      {addTimeLoading ? "Adding…" : `+${EXTRA_TIME_SECONDS_DISPLAY}s${extraTimeCost != null ? ` (${extraTimeCost} cr)` : ""}`}
                     </Button>
                   )}
 
@@ -1980,6 +2256,20 @@ export default function Game() {
                         </Button>
                       )}
                     </div>
+                  ) : analysisError === "insufficient_credits" ? (
+                    <div className="space-y-3">
+                      <div className="bg-brand-dim border border-brand rounded-sm p-3">
+                        <p className="text-sm text-ink font-semibold">Unlock this game's review</p>
+                        <p className="text-xs text-ink-secondary mt-1">Spend a few credits to see blunder detection, accuracy, and move-by-move annotations for this game.</p>
+                      </div>
+                      <Button
+                        onClick={() => navigate("/wallet")}
+                        size="sm"
+                        className="w-full bg-brand text-brand-on hover:bg-brand-hover"
+                      >
+                        Buy credits
+                      </Button>
+                    </div>
                   ) : analysisError ? (
                     <div className="space-y-2">
                       <div className="text-sm text-danger">{analysisError}</div>
@@ -2066,6 +2356,89 @@ export default function Game() {
                 </div>
               )}
             </div>
+
+            {/* Deep/cloud analysis (Phase 4a) — own games only, separate
+                paid unlock from the standard review above. */}
+            {canShowAnalysis && !isImportedPgn && playerColor && (
+              <div className="bg-surface-1 border border-hair rounded-sm p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-ink font-semibold text-sm">Deep Analysis</h3>
+                  {deepAnalysis && (
+                    <Button
+                      onClick={runDeepAnalysis}
+                      size="sm"
+                      variant="outline"
+                      className="bg-transparent border-hair text-ink hover:bg-surface-2"
+                      disabled={deepAnalysisLoading}
+                    >
+                      Refresh
+                    </Button>
+                  )}
+                </div>
+
+                {deepAnalysisLoading ? (
+                  <div className="text-ink-secondary text-sm">Running deep analysis, please wait...</div>
+                ) : deepAnalysisError === "insufficient_credits" ? (
+                  <div className="space-y-3">
+                    <div className="bg-brand-dim border border-brand rounded-sm p-3">
+                      <p className="text-sm text-ink font-semibold">Unlock deeper analysis</p>
+                      <p className="text-xs text-ink-secondary mt-1">
+                        Go beyond the standard review with a much deeper engine pass on this game.
+                        {deepAnalysisCost != null ? ` Costs ${deepAnalysisCost} credits.` : ""}
+                      </p>
+                    </div>
+                    <Button
+                      onClick={() => navigate("/wallet")}
+                      size="sm"
+                      className="w-full bg-brand text-brand-on hover:bg-brand-hover"
+                    >
+                      Buy credits
+                    </Button>
+                  </div>
+                ) : deepAnalysisError ? (
+                  <div className="space-y-2">
+                    <div className="text-sm text-danger">{deepAnalysisError}</div>
+                    <Button
+                      onClick={runDeepAnalysis}
+                      size="sm"
+                      variant="outline"
+                      className="bg-transparent border-hair text-ink hover:bg-surface-2"
+                    >
+                      Retry
+                    </Button>
+                  </div>
+                ) : deepAnalysis ? (
+                  <div className="space-y-3 text-sm font-mono">
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-surface-2 rounded-sm p-3">
+                        <p className="text-ink-secondary text-xs uppercase">Depth</p>
+                        <p className="text-ink text-lg font-semibold">{deepAnalysis.depth}</p>
+                      </div>
+                      <div className="bg-surface-2 rounded-sm p-3">
+                        <p className="text-ink-secondary text-xs uppercase">Blunders</p>
+                        <p className="text-danger text-lg font-semibold">{deepAnalysis.summary?.blunder ?? 0}</p>
+                      </div>
+                    </div>
+                    <p className="text-xs text-ink-secondary">
+                      {deepAnalysis.summary?.best ?? 0} best · {deepAnalysis.summary?.mistake ?? 0} mistakes · {deepAnalysis.summary?.inaccuracy ?? 0} inaccuracies
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <p className="text-ink-secondary text-sm">
+                      Get a deeper Stockfish pass (depth {`>`}12) on this game beyond the standard review.
+                    </p>
+                    <Button
+                      onClick={runDeepAnalysis}
+                      size="sm"
+                      className="w-full bg-brand text-brand-on hover:bg-brand-hover"
+                    >
+                      {`Run Deep Analysis${deepAnalysisCost != null ? ` (${deepAnalysisCost} cr)` : ""}`}
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Move History */}
             <div className="bg-surface-1 border border-hair rounded-sm">

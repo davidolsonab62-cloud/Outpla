@@ -3,8 +3,13 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import os
 import re
+import io
+import hashlib
 import shutil
 import logging
 from pathlib import Path
@@ -280,8 +285,13 @@ class UserResponse(BaseModel):
     losses: int = 0
     draws: int = 0
     wallet_balance: Dict[str, float] = Field(default_factory=lambda: {"USDT": 0, "BTC": 0, "ETH": 0})
+    credits_balance: int = 0
     allow_spectators: bool = True
     allow_chat_broadcast: bool = True
+    # IANA timezone name (e.g. "America/New_York"), used to localize
+    # daily-reset features like Phase 4b's puzzle retry/skip budgets.
+    # None means "not set yet" - callers fall back to UTC.
+    timezone: Optional[str] = None
     created_at: Optional[str] = None
     is_admin: bool = False
     is_flagged: bool = False
@@ -323,6 +333,10 @@ class GameResponse(BaseModel):
     is_private: bool = False
     game_type: str = "rapid"
     tournament_id: Optional[str] = None
+    # Phase 4c: boosted lobby visibility ("featured game"). Defaulted so
+    # existing game docs without these fields still validate.
+    featured: bool = False
+    featured_until: Optional[str] = None
 
 class MatchmakingRequest(BaseModel):
     time_control: str = "10+0"
@@ -385,6 +399,55 @@ class WithdrawStatusUpdate(BaseModel):
     status: str  # confirmed, rejected
     admin_note: Optional[str] = None
 
+class CreditTransactionResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    tx_id: str
+    user_id: str
+    amount: int
+    type: str
+    reference_id: Optional[str] = None
+    resulting_balance: int
+    created_at: str
+
+class BuyCreditsRequest(BaseModel):
+    amount_usdt: float
+
+class SpendCreditsRequest(BaseModel):
+    feature_key: str
+    reference_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class CreditFeatureCostUpdate(BaseModel):
+    cost: int
+    category: Optional[str] = None
+
+class PGNAnalyzeRequest(BaseModel):
+    pgn: str
+
+class PGNImportRequest(BaseModel):
+    # Optional client-supplied identifier for the imported PGN (e.g. a hash
+    # of its contents) so the ledger/reference_id for a paid import can be
+    # traced back to a specific game; not required to record the import.
+    reference_id: Optional[str] = None
+
+class ClockPresetCreate(BaseModel):
+    # Phase 4e: a user-saved custom time control for the standalone Chess
+    # Clock tool (/chess-clock), beyond the small set of built-in defaults
+    # the frontend already offers (1+0, 3+0, 5+0, 10+0, 15+10).
+    name: str
+    white_minutes: float
+    black_minutes: float
+    increment_seconds: int = 0
+
+class ClockPresetResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    preset_id: str
+    name: str
+    white_minutes: float
+    black_minutes: float
+    increment_seconds: int = 0
+    created_at: str
+
 class AdminSettingsUpdate(BaseModel):
     arbiter_fee: Optional[float] = None
     min_stake: Optional[float] = None
@@ -435,6 +498,24 @@ class TournamentCreate(BaseModel):
     start_time: Optional[str] = None
     duration_minutes: int = 60
 
+# Phase 4c: user-facing (non-admin) tournament creation. Deliberately a
+# separate, smaller model from TournamentCreate rather than reusing it -
+# no start_time (always starts shortly after creation, same as an unset
+# admin start_time) and tighter default caps appropriate for a private
+# group instead of a public arena event.
+class PrivateTournamentCreate(BaseModel):
+    name: str
+    time_control: str = "3+2"
+    entry_fee: float = 0
+    entry_currency: str = "USDT"
+    min_players: int = 2
+    max_players: int = 16
+    tournament_type: str = "arena"
+    duration_minutes: int = 60
+
+class JoinTournamentRequest(BaseModel):
+    invite_code: Optional[str] = None
+
 class TournamentResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
     tournament_id: str
@@ -455,6 +536,12 @@ class TournamentResponse(BaseModel):
     players: List[Dict] = []
     leaderboard: List[Dict] = []
     pairings: List[Dict] = Field(default_factory=list)
+    # Phase 4c: private/custom tournaments. Defaulted so older (admin,
+    # public) tournament docs without these fields still validate fine -
+    # they just read as is_private=False, invite_code=None.
+    is_private: bool = False
+    invite_code: Optional[str] = None
+    created_by: Optional[str] = None
 
 # ============= HELPER FUNCTIONS =============
 
@@ -812,6 +899,11 @@ async def create_tournament_game(tournament: dict, white_player: dict, black_pla
         "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "moves": [],
         "move_times": [],
+        # Phase 4e: pre-move fen/clock snapshots, pushed to in make_move -
+        # what takeback_token pops back to. Present on every game doc from
+        # creation so make_move never has to special-case a missing array.
+        "fen_history": [],
+        "clock_history": [],
         "white_time": base_time,
         "black_time": base_time,
         "current_turn": "white",
@@ -1619,6 +1711,7 @@ async def register(request: Request, user_data: UserCreate, response: Response):
         "losses": 0,
         "draws": 0,
         "wallet_balance": {"USDT": 100.0, "BTC": 0.001, "ETH": 0.01},
+        "credits_balance": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "is_admin": False,
         "is_flagged": False,
@@ -1626,7 +1719,11 @@ async def register(request: Request, user_data: UserCreate, response: Response):
     }
     
     await db.users.insert_one(user_doc)
-     
+
+    # Signup bonus: 400 free credits, granted once here at account creation.
+    bonus_entry = await grant_credits(user_id, SIGNUP_BONUS_CREDITS, "signup_bonus")
+    user_doc["credits_balance"] = bonus_entry["resulting_balance"]
+
     # Track IP
     await check_ip_abuse(request, user_id)
     
@@ -1893,12 +1990,15 @@ async def create_session(request: Request, response: Response):
             "losses": 0,
             "draws": 0,
             "wallet_balance": {"USDT": 100.0, "BTC": 0.001, "ETH": 0.01},
+            "credits_balance": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "is_admin": False,
             "is_flagged": False,
             "is_banned": False
         }
         await db.users.insert_one(user)
+        # Signup bonus: 400 free credits, granted once here at account creation.
+        await grant_credits(user_id, SIGNUP_BONUS_CREDITS, "signup_bonus")
         user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     
     if user.get("is_banned"):
@@ -2048,6 +2148,9 @@ async def create_game(game_data: GameCreate, request: Request):
         "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "moves": [],
         "move_times": [],
+        # Phase 4e: see create_tournament_game for why these start empty.
+        "fen_history": [],
+        "clock_history": [],
         "white_time": base_time,
         "black_time": base_time,
         "current_turn": "white",
@@ -2227,6 +2330,9 @@ async def find_match(request: Request, match_data: MatchmakingRequest = Matchmak
         "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "moves": [],
         "move_times": [],
+        # Phase 4e: see create_tournament_game for why these start empty.
+        "fen_history": [],
+        "clock_history": [],
         "white_time": base_time,
         "black_time": base_time,
         "current_turn": "white",
@@ -2898,8 +3004,61 @@ async def list_games(status: Optional[str] = None, game_type: Optional[str] = No
     if game_type:
         query["game_type"] = game_type
 
-    games = await db.games.find(query, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
+    # Phase 4c: a currently-boosted ("featured") game sorts to the top of
+    # the lobby, ahead of the normal newest-first ordering. featured_until
+    # is compared as an ISO string against "now" - safe since both are
+    # UTC ISO 8601, which sort lexicographically the same as chronologically.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pipeline = [
+        {"$match": query},
+        {"$addFields": {
+            "_is_featured_now": {
+                "$and": [
+                    {"$eq": ["$featured", True]},
+                    {"$gt": ["$featured_until", now_iso]},
+                ]
+            }
+        }},
+        {"$sort": {"_is_featured_now": -1, "created_at": -1}},
+        {"$limit": 50},
+        {"$project": {"_id": 0, "_is_featured_now": 0}},
+    ]
+    games = await db.games.aggregate(pipeline).to_list(50)
     return games
+
+
+@api_router.post("/games/{game_id}/boost")
+async def boost_game(game_id: str, request: Request):
+    """Phase 4c: pay credits to feature a still-open game at the top of
+    the lobby for FEATURED_GAME_MINUTES ('featured game'). Only the
+    game's own creator can boost it, and only while it's still waiting
+    for an opponent - once someone joins, there's no lobby listing left
+    for a boost to matter in."""
+    user = await get_current_user(request)
+    game = await db.games.find_one({"game_id": game_id}, {"_id": 0})
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    if game.get("status") != "waiting":
+        raise HTTPException(status_code=400, detail="Only open games waiting for an opponent can be boosted")
+
+    creator_id = (game.get("white_player") or {}).get("user_id")
+    if creator_id != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Only the game's creator can boost it")
+
+    spend_result = await spend_credits(user["user_id"], "featured_game", reference_id=game_id)
+
+    featured_until = (datetime.now(timezone.utc) + timedelta(minutes=FEATURED_GAME_MINUTES)).isoformat()
+    await db.games.update_one(
+        {"game_id": game_id},
+        {"$set": {"featured": True, "featured_until": featured_until}}
+    )
+
+    try:
+        await sio.emit("game_updated", {"game_id": game_id, "featured": True, "featured_until": featured_until})
+    except Exception:
+        logger.exception("Failed to emit game_updated for boost")
+
+    return {"success": True, "featured_until": featured_until, "spend": spend_result}
 
 
 @api_router.post("/games/{game_id}/analysis")
@@ -2918,7 +3077,9 @@ async def analyze_game(game_id: str, request: Request):
     if game.get("status") != "completed":
         raise HTTPException(status_code=403, detail="Analysis is only available for completed games")
 
-    # Check if Stockfish is available before attempting analysis
+    # Check if Stockfish is available before attempting analysis (and
+    # before charging anything - a user shouldn't pay for an unlock that
+    # can't actually produce a review).
     if not STOCKFISH_AVAILABLE:
         logger.warning(f"Stockfish not available for analysis of game {game_id}")
         analysis_doc = {
@@ -2933,6 +3094,16 @@ async def analyze_game(game_id: str, request: Request):
         }
         await db.games.update_one({"game_id": game_id}, {"$set": {"analysis": analysis_doc}})
         return {"success": False, "analysis": analysis_doc, "engine_available": False}
+
+    # Phase 4a: per-user paid unlock (feature key "game_review"). The
+    # underlying Stockfish result is cached/shared on the game doc below,
+    # but each viewing user is billed once via _claim_unlock - see that
+    # function's docstring for why the claim happens before the charge.
+    # Raises HTTPException(402) if the user has insufficient credits.
+    await _claim_unlock(
+        db.game_review_unlocks, user["user_id"], {"game_id": game_id},
+        "game_review", reference_id=game_id,
+    )
 
     starting_fen = game.get("initial_fen") if game.get("initial_fen") else None
 
@@ -2991,17 +3162,18 @@ async def get_game_analysis(game_id: str, request: Request):
     if game.get("status") != "completed":
         raise HTTPException(status_code=403, detail="Analysis is only available for completed games")
 
-    if analysis:
-        return {"analysis": analysis}
-
     # Fallback: run analysis if game has moves and the game is completed
     moves = game.get("moves", [])
 
-    if not moves:
+    if not analysis and not moves:
         raise HTTPException(status_code=400, detail="No moves to analyze")
 
-    # Check if Stockfish is available before attempting analysis
-    if not STOCKFISH_AVAILABLE:
+    # Check if Stockfish is available before attempting analysis. Checked
+    # before the paid unlock below so a user isn't charged for a review
+    # the engine can't actually produce - but if analysis is already
+    # cached, Stockfish availability is moot, so this only applies to the
+    # not-yet-computed path.
+    if not analysis and not STOCKFISH_AVAILABLE:
         logger.warning(f"Stockfish not available for analysis of game {game_id}")
         # Return a cached empty analysis instead of 503
         return {
@@ -3016,6 +3188,18 @@ async def get_game_analysis(game_id: str, request: Request):
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
         }
+
+    # Phase 4a: per-user paid unlock (feature key "game_review"). Applies
+    # whether analysis is already cached or still needs computing - see
+    # _claim_unlock's docstring. Raises HTTPException(402) if the user
+    # doesn't have enough credits.
+    await _claim_unlock(
+        db.game_review_unlocks, user["user_id"], {"game_id": game_id},
+        "game_review", reference_id=game_id,
+    )
+
+    if analysis:
+        return {"analysis": analysis}
 
     # If another request is already analyzing this exact game, don't start a second
     # blocking Stockfish run — just tell the frontend to keep polling/waiting.
@@ -3111,7 +3295,16 @@ async def make_move(game_id: str, move_data: MoveRequest, request: Request):
     
     # Record move time for anti-cheat
     move_time = move_data.move_time if move_data.move_time else 0
-    
+
+    # Phase 4e: snapshot the board/clock as they stood immediately BEFORE
+    # this move, so a takeback_token can pop straight back to it later.
+    # Pushed every move regardless of whether takeback ever gets used on
+    # this particular game - cheap to store, and the alternative (trying
+    # to reconstruct history from `moves` after the fact) would require
+    # replaying the whole game through a chess engine at takeback time.
+    pre_move_fen = game["fen"]
+    pre_move_clock = {"white_time": game.get("white_time"), "black_time": game.get("black_time")}
+
     await db.games.update_one(
         {"game_id": game_id},
         {
@@ -3122,7 +3315,9 @@ async def make_move(game_id: str, move_data: MoveRequest, request: Request):
             },
             "$push": {
                 "moves": move_data.move,
-                "move_times": move_time
+                "move_times": move_time,
+                "fen_history": pre_move_fen,
+                "clock_history": pre_move_clock
             }
         }
     )
@@ -3410,6 +3605,117 @@ async def abandon_game(game_id: str, request: Request):
     return {"success": True}
 
 
+@api_router.post("/games/{game_id}/rematch")
+async def request_rematch(game_id: str, request: Request):
+    """Phase 4c: spend a 'rematch token' to instantly re-challenge your
+    opponent from a just-finished CASUAL game. Staked games are
+    structurally excluded here (stake_amount == 0 required) - a rematch
+    token can never become a way to re-enter a staked game without going
+    through the normal create-game/stake flow and its wallet checks.
+
+    Rather than force the opponent into a new game unilaterally, this
+    creates a fresh waiting game and sends it through the existing
+    challenge/accept flow - the opponent still has to accept, same as any
+    other challenge."""
+    user = await get_current_user(request)
+    game = await db.games.find_one({"game_id": game_id}, {"_id": 0})
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    if game.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Rematch is only available once the game has ended")
+    if game.get("stake_amount", 0) > 0:
+        raise HTTPException(status_code=400, detail="Rematch tokens can only be used for casual (non-staked) games")
+
+    white = game.get("white_player") or {}
+    black = game.get("black_player") or {}
+    if user["user_id"] == white.get("user_id"):
+        opponent_id = black.get("user_id")
+    elif user["user_id"] == black.get("user_id"):
+        opponent_id = white.get("user_id")
+    else:
+        raise HTTPException(status_code=403, detail="You did not play in this game")
+    if not opponent_id:
+        raise HTTPException(status_code=400, detail="Original opponent is unavailable for a rematch")
+
+    _enforce_game_creation_rate_limit(user["user_id"])
+
+    spend_result = await spend_credits(user["user_id"], "rematch_token", reference_id=game_id)
+
+    parts = game["time_control"].split("+")
+    base_time = int(parts[0]) * 60
+    new_game_id = f"game_{uuid.uuid4().hex[:12]}"
+    new_game_doc = {
+        "game_id": new_game_id,
+        "white_player": {
+            "user_id": user["user_id"],
+            "username": user["username"],
+            "rating": user.get("rating", 1200),
+            "allow_spectators": user.get("allow_spectators", True),
+            "allow_chat_broadcast": user.get("allow_chat_broadcast", True),
+        },
+        "black_player": None,
+        "time_control": game["time_control"],
+        "stake_amount": 0,
+        "stake_currency": game.get("stake_currency", "USDT"),
+        "arbiter_fee": 0.02,
+        "status": "waiting",
+        "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "moves": [],
+        "move_times": [],
+        # Phase 4e: see create_tournament_game for why these start empty.
+        "fen_history": [],
+        "clock_history": [],
+        "white_time": base_time,
+        "black_time": base_time,
+        "current_turn": "white",
+        "result": None,
+        "winner_id": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        # Private: this game is only meant for the two rematching
+        # players, not the public lobby/matchmaking pool.
+        "is_private": True,
+        "game_type": game.get("game_type", "rapid"),
+        "tournament_id": None,
+        "featured": False,
+        "featured_until": None,
+    }
+
+    try:
+        await db.games.insert_one(dict(new_game_doc))
+    except Exception:
+        await grant_credits(
+            user["user_id"], spend_result["cost"], "refund",
+            reference_id=spend_result.get("tx_id"),
+            metadata={"reason": "rematch_game_create_failed"},
+        )
+        raise
+
+    challenge_id = f"challenge_{uuid.uuid4().hex[:12]}"
+    challenge_doc = {
+        "challenge_id": challenge_id,
+        "from_user_id": user["user_id"],
+        "to_user_id": opponent_id,
+        "game_id": new_game_id,
+        "message": "Rematch!",
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.challenges.insert_one(challenge_doc)
+
+    try:
+        await sio.emit('challenge_received', {
+            "challenge_id": challenge_id,
+            "from_user_id": user["user_id"],
+            "from_username": user.get("username"),
+            "game_id": new_game_id,
+            "message": "Rematch!"
+        }, room=f"user_{opponent_id}")
+    except Exception:
+        logger.exception("Failed to emit challenge_received for rematch")
+
+    return {"success": True, "game_id": new_game_id, "challenge_id": challenge_id, "spend": spend_result}
+
+
 @api_router.post("/challenges")
 async def create_challenge(request: Request):
     user = await get_current_user(request)
@@ -3440,6 +3746,16 @@ async def create_challenge(request: Request):
             raise HTTPException(status_code=403, detail=f"User does not accept challenges from players above rating {max_rating}")
 
     challenge_id = f"challenge_{uuid.uuid4().hex[:12]}"
+
+    # Phase 4c: free challenge invites up to CHALLENGE_FREE_DAILY_INVITES
+    # per day, then charged in credits. Checked before the challenge is
+    # created so a 402 here never creates a dangling challenge doc; usage
+    # is only recorded after the insert actually succeeds.
+    budget_result = await _consume_daily_budget(
+        user, "challenges_sent", CHALLENGE_FREE_DAILY_INVITES, "challenge_invite_extra",
+        reference_id=challenge_id, collection=db.social_daily_usage,
+    )
+
     challenge_doc = {
         "challenge_id": challenge_id,
         "from_user_id": user["user_id"],
@@ -3450,7 +3766,22 @@ async def create_challenge(request: Request):
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
-    await db.challenges.insert_one(challenge_doc)
+    # If this invite was paid (past the free daily limit), refund on
+    # insert failure rather than leave the user billed for a challenge
+    # that doesn't exist - same pattern as rematch/private-tournament.
+    try:
+        await db.challenges.insert_one(challenge_doc)
+    except Exception:
+        if budget_result.get("paid"):
+            spend = budget_result["spend"]
+            await grant_credits(
+                user["user_id"], spend["cost"], "refund",
+                reference_id=spend.get("tx_id"),
+                metadata={"reason": "challenge_create_failed"},
+            )
+        raise
+
+    await _record_daily_usage(user, "challenges_sent", collection=db.social_daily_usage)
 
     # Notify target user via their personal room
     try:
@@ -3464,7 +3795,27 @@ async def create_challenge(request: Request):
     except Exception:
         logger.exception("Failed to emit challenge_received")
 
-    return {"success": True, "challenge_id": challenge_id}
+    return {"success": True, "challenge_id": challenge_id, "credits_charged": budget_result["paid"]}
+
+
+@api_router.get("/challenges/invite-status")
+async def get_challenge_invite_status(request: Request):
+    """Phase 5: read-only preview of today's free challenge-invite budget
+    and what the next one beyond it would cost, so the frontend can show
+    'X free invites left today' near wherever a challenge gets sent (e.g.
+    Leaderboard's per-row challenge button) instead of the price only
+    surfacing after a 402. Never charges or increments."""
+    user = await get_current_user(request)
+    today = _today_str_for_timezone(user.get("timezone"))
+    progress = await db.social_daily_usage.find_one({"user_id": user["user_id"]}, {"_id": 0}) or {}
+    used_today = progress.get("challenges_sent_today", 0) if progress.get("challenges_sent_date") == today else 0
+    cost = await get_credit_feature_cost("challenge_invite_extra")
+    return {
+        "used_today": used_today,
+        "free_limit": CHALLENGE_FREE_DAILY_INVITES,
+        "remaining_free": max(0, CHALLENGE_FREE_DAILY_INVITES - used_today),
+        "cost": cost,
+    }
 
 
 @api_router.get("/challenges/pending")
@@ -3680,7 +4031,10 @@ async def create_tournament(tournament_data: TournamentCreate, request: Request)
         "created_at": datetime.now(timezone.utc).isoformat(),
         "players": [],
         "leaderboard": [],
-        "pairings": []
+        "pairings": [],
+        "is_private": False,
+        "invite_code": None,
+        "created_by": None,
     }
     
     await db.tournaments.insert_one(tournament_doc)
@@ -3690,7 +4044,10 @@ async def create_tournament(tournament_data: TournamentCreate, request: Request)
 
 @api_router.get("/tournaments", response_model=List[TournamentResponse])
 async def list_tournaments(status: Optional[str] = None):
-    query = {}
+    # Phase 4c: private tournaments never show up in the general public
+    # listing - they're only reachable via their direct invite link, or
+    # via /tournaments/mine for players already in one.
+    query = {"is_private": {"$ne": True}}
     if status:
         query["status"] = status
 
@@ -3744,8 +4101,64 @@ async def get_tournament(tournament_id: str):
         raise HTTPException(status_code=404, detail="Tournament not found")
     return TournamentResponse(**tournament)
 
+async def _join_tournament_player(tournament: dict, user: dict) -> None:
+    """Shared 'add this user as a tournament player' logic: entry-fee
+    deduction + ledger row (if there's an entry fee), then the players/
+    leaderboard/current_players/prize_pool update. Extracted so both the
+    regular join endpoint and Phase 4c's private-tournament creation
+    (where the creator auto-joins their own tournament) go through
+    identical accounting - no separate 'creator' code path that could
+    drift from the normal join path. Callers are responsible for their
+    own pre-checks (status, capacity, not-already-joined, invite code);
+    this function only does the join itself."""
+    tournament_id = tournament["tournament_id"]
+
+    if tournament["entry_fee"] > 0:
+        balance = user.get("wallet_balance", {}).get(tournament["entry_currency"], 0)
+        if balance < tournament["entry_fee"]:
+            raise HTTPException(status_code=400, detail="Insufficient balance")
+
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$inc": {f"wallet_balance.{tournament['entry_currency']}": -tournament["entry_fee"]}}
+        )
+
+        await db.transactions.insert_one({
+            "tx_id": f"tx_{uuid.uuid4().hex[:12]}",
+            "user_id": user["user_id"],
+            "tx_type": "tournament_entry",
+            "amount": -tournament["entry_fee"],
+            "currency": tournament["entry_currency"],
+            "status": "completed",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "related_tournament_id": tournament_id
+        })
+
+    player_entry = {
+        "user_id": user["user_id"],
+        "username": user["username"],
+        "rating": user.get("rating", 1200),
+        "score": 0,
+        "games_played": 0,
+        "wins": 0,
+        "losses": 0,
+        "draws": 0,
+        "current_game_id": None,
+        "in_match": False,
+        "joined_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    await db.tournaments.update_one(
+        {"tournament_id": tournament_id},
+        {
+            "$push": {"players": player_entry, "leaderboard": player_entry},
+            "$inc": {"current_players": 1, "prize_pool": tournament["entry_fee"]}
+        }
+    )
+
+
 @api_router.post("/tournaments/{tournament_id}/join")
-async def join_tournament(tournament_id: str, request: Request):
+async def join_tournament(tournament_id: str, request: Request, join_data: Optional[JoinTournamentRequest] = None):
     user = await get_current_user(request)
     
     tournament = await db.tournaments.find_one({"tournament_id": tournament_id}, {"_id": 0})
@@ -3761,51 +4174,15 @@ async def join_tournament(tournament_id: str, request: Request):
     # Check if already joined
     if any(p["user_id"] == user["user_id"] for p in tournament.get("players", [])):
         raise HTTPException(status_code=400, detail="Already joined this tournament")
-    
-    # Deduct entry fee
-    if tournament["entry_fee"] > 0:
-        balance = user.get("wallet_balance", {}).get(tournament["entry_currency"], 0)
-        if balance < tournament["entry_fee"]:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-        
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$inc": {f"wallet_balance.{tournament['entry_currency']}": -tournament["entry_fee"]}}
-        )
-        
-        await db.transactions.insert_one({
-            "tx_id": f"tx_{uuid.uuid4().hex[:12]}",
-            "user_id": user["user_id"],
-            "tx_type": "tournament_entry",
-            "amount": -tournament["entry_fee"],
-            "currency": tournament["entry_currency"],
-            "status": "completed",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "related_tournament_id": tournament_id
-        })
-    
-    # Add player
-    player_entry = {
-        "user_id": user["user_id"],
-        "username": user["username"],
-        "rating": user.get("rating", 1200),
-        "score": 0,
-        "games_played": 0,
-        "wins": 0,
-        "losses": 0,
-        "draws": 0,
-        "current_game_id": None,
-        "in_match": False,
-        "joined_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    await db.tournaments.update_one(
-        {"tournament_id": tournament_id},
-        {
-            "$push": {"players": player_entry, "leaderboard": player_entry},
-            "$inc": {"current_players": 1, "prize_pool": tournament["entry_fee"]}
-        }
-    )
+
+    # Phase 4c: private tournaments require the right invite code - this
+    # is what makes them "private" rather than just hidden from the list.
+    if tournament.get("is_private"):
+        provided_code = join_data.invite_code if join_data else None
+        if not provided_code or provided_code != tournament.get("invite_code"):
+            raise HTTPException(status_code=403, detail="Valid invite code required to join this private tournament")
+
+    await _join_tournament_player(tournament, user)
 
     if tournament["status"] == "active":
         # Tournament is already running - get this player straight into a
@@ -3813,6 +4190,102 @@ async def join_tournament(tournament_id: str, request: Request):
         await auto_pair_tournament(tournament_id)
 
     return {"success": True, "message": "Joined tournament successfully"}
+
+
+# ============= PHASE 4c: SOCIAL & COMPETITIVE FEATURES =============
+# Feature keys introduced in this phase (price each via
+# PUT /admin/credit-feature-costs/{feature_key}, same as 4a/4b):
+#   - "private_tournament_create"  one-time charge to create a
+#                                   user-owned private tournament
+#   - "challenge_invite_extra"     extra challenge sent after
+#                                   CHALLENGE_FREE_DAILY_INVITES free ones
+#                                   today (daily budget, same pattern as
+#                                   Phase 4b's puzzle retries/skips)
+#   - "featured_game"              boosts a waiting game to the top of the
+#                                   lobby for FEATURED_GAME_MINUTES
+#   - "rematch_token"              instantly re-challenges the opponent
+#                                   from a just-finished CASUAL game
+#
+# None of these have a cost until an admin sets one - spend_credits()
+# 500s on an unpriced feature_key by design.
+
+# Free daily challenge invites before "challenge_invite_extra" kicks in.
+# Same shape as Phase 4b's PUZZLE_FREE_DAILY_* constants - a code-level
+# default for the free tier, while the credit *price* stays admin-configurable.
+CHALLENGE_FREE_DAILY_INVITES = 5
+# How long a boosted ("featured") game stays pinned at the top of the lobby.
+FEATURED_GAME_MINUTES = 15
+
+
+@api_router.post("/tournaments/private", response_model=TournamentResponse)
+async def create_private_tournament(tournament_data: PrivateTournamentCreate, request: Request):
+    """Phase 4c: any logged-in user (not just admins) can create their own
+    private tournament, gated behind credits. Unlike the admin endpoint,
+    this always starts private with a fresh invite_code, and the creator
+    is auto-joined via the same _join_tournament_player path everyone
+    else uses."""
+    user = await get_current_user(request)
+
+    if tournament_data.min_players < 2:
+        raise HTTPException(status_code=400, detail="min_players must be at least 2")
+    if tournament_data.max_players < tournament_data.min_players:
+        raise HTTPException(status_code=400, detail="max_players must be >= min_players")
+
+    # Charge before creating anything - if the insert below somehow fails,
+    # we refund immediately rather than leave the user billed for a
+    # tournament that doesn't exist (same pattern as Phase 2's purchase
+    # flow refunding a failed grant_credits after the wallet was debited).
+    spend_result = await spend_credits(
+        user["user_id"], "private_tournament_create", reference_id=None,
+        metadata={"name": tournament_data.name},
+    )
+
+    tournament_id = f"tourney_{uuid.uuid4().hex[:12]}"
+    invite_code = uuid.uuid4().hex[:10]
+    start_time = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+
+    tournament_doc = {
+        "tournament_id": tournament_id,
+        "name": tournament_data.name,
+        "time_control": tournament_data.time_control,
+        "entry_fee": tournament_data.entry_fee,
+        "entry_currency": tournament_data.entry_currency,
+        "prize_pool": 0,
+        "min_players": tournament_data.min_players,
+        "max_players": tournament_data.max_players,
+        "current_players": 0,
+        "tournament_type": tournament_data.tournament_type,
+        "status": "upcoming",
+        "start_time": start_time,
+        "end_time": None,
+        "duration_minutes": tournament_data.duration_minutes,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "players": [],
+        "leaderboard": [],
+        "pairings": [],
+        "is_private": True,
+        "invite_code": invite_code,
+        "created_by": user["user_id"],
+    }
+
+    try:
+        await db.tournaments.insert_one(dict(tournament_doc))
+    except Exception:
+        await grant_credits(
+            user["user_id"], spend_result["cost"], "refund",
+            reference_id=spend_result.get("tx_id"),
+            metadata={"reason": "private_tournament_create_failed"},
+        )
+        raise
+
+    # Creator auto-joins their own tournament through the normal join
+    # path, so they don't need their own invite code and the tournament
+    # immediately shows up under /tournaments/mine.
+    fresh_user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0}) or user
+    await _join_tournament_player(tournament_doc, fresh_user)
+
+    final_doc = await db.tournaments.find_one({"tournament_id": tournament_id}, {"_id": 0})
+    return TournamentResponse(**final_doc)
 
 @api_router.post("/tournaments/{tournament_id}/leave")
 async def leave_tournament(tournament_id: str, request: Request):
@@ -4007,6 +4480,673 @@ async def end_tournament(tournament_id: str, request: Request):
     await finish_tournament(tournament)
 
     return {"success": True}
+
+# ============= CREDITS SYSTEM (Phase 1: data model) =============
+# Locked decisions — do not change without explicit approval:
+#   - Exchange rate: 100 credits = $1 USD
+#   - Signup bonus: 400 free credits, granted once, on account creation
+#   - Credits are one-way (wallet -> credits) only. Nothing in this module
+#     may convert credits back into wallet_balance or touch staked-game
+#     settlement. Enforced here at the data layer: grant_credits() is the
+#     only function allowed to touch users.credits_balance, and it has no
+#     path that writes to wallet_balance.
+CREDITS_PER_USD = 100
+SIGNUP_BONUS_CREDITS = 400
+
+# Phase 2: preset packs shown in the "Buy credits" UI. Purely a UI
+# convenience list (users can also enter a custom amount) - not the same
+# thing as credit_feature_costs, which prices what credits can be spent on.
+CREDIT_PACKS_USDT = [5, 10, 25, 50, 100]
+
+# credit_transactions.type values used so far: "signup_bonus", "purchase",
+# "spend". Phase 3 also adds "refund" once a spend needs reversing.
+# Every entry is an immutable row - never updated or deleted, only inserted.
+# users.credits_balance is a cached running total; credit_transactions is
+# the source of truth and must always be able to reproduce it (see
+# compute_credits_balance_from_ledger below).
+
+async def grant_credits(
+    user_id: str,
+    amount: int,
+    tx_type: str,
+    reference_id: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> dict:
+    """Atomically adjust a user's credits_balance and write an immutable
+    ledger row for it. `amount` is signed: positive credits the account,
+    negative debits it. This is the only function that should ever modify
+    users.credits_balance - Phase 2 (purchases) and Phase 3 (spend) must be
+    built on top of this rather than reimplementing the $inc themselves, so
+    every balance change is guaranteed to have a matching ledger row.
+
+    For a debit, the balance check and the decrement happen in a single
+    atomic find_one_and_update (filtered on credits_balance >= amount owed)
+    so two concurrent debits can't both pass a separate balance check and
+    take the balance negative.
+
+    Returns the ledger entry that was written. Raises HTTPException(400) if
+    a debit would take the balance below zero, and HTTPException(404) if
+    the user doesn't exist.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    if amount < 0:
+        updated = await db.users.find_one_and_update(
+            {"user_id": user_id, "credits_balance": {"$gte": -amount}},
+            {"$inc": {"credits_balance": amount}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is None:
+            exists = await db.users.find_one({"user_id": user_id}, {"_id": 0, "user_id": 1})
+            if exists is None:
+                raise HTTPException(status_code=404, detail="User not found")
+            raise HTTPException(status_code=400, detail="Insufficient credits")
+    else:
+        updated = await db.users.find_one_and_update(
+            {"user_id": user_id},
+            {"$inc": {"credits_balance": amount}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
+    resulting_balance = updated.get("credits_balance", 0)
+
+    ledger_entry = {
+        "tx_id": f"ctx_{uuid.uuid4().hex[:12]}",
+        "user_id": user_id,
+        "amount": amount,
+        "type": tx_type,
+        "reference_id": reference_id,
+        "metadata": metadata or {},
+        "resulting_balance": resulting_balance,
+        "created_at": now,
+    }
+    await db.credit_transactions.insert_one(dict(ledger_entry))
+
+    return ledger_entry
+
+
+async def compute_credits_balance_from_ledger(user_id: str) -> int:
+    """Recompute a user's credits balance purely by summing their ledger
+    rows. Used for auditing - should always equal users.credits_balance."""
+    total = 0
+    cursor = db.credit_transactions.find({"user_id": user_id}, {"_id": 0, "amount": 1})
+    async for entry in cursor:
+        total += entry.get("amount", 0)
+    return total
+
+
+async def get_credit_feature_cost(feature_key: str) -> Optional[int]:
+    """Look up a feature's credit cost from the credit_feature_costs config
+    collection. Returns None if the feature has no configured cost (not
+    yet gated). Pricing lives here, not in code, so it can change without
+    a deploy - see Phase 4 for feature gating built on this."""
+    doc = await db.credit_feature_costs.find_one({"feature_key": feature_key}, {"_id": 0})
+    return doc.get("cost") if doc else None
+
+
+@api_router.get("/credits/balance")
+async def get_credits_balance(request: Request):
+    user = await get_current_user(request)
+    return {
+        "credits_balance": user.get("credits_balance", 0),
+        "ledger_balance": await compute_credits_balance_from_ledger(user["user_id"]),
+    }
+
+
+@api_router.get("/credits/transactions", response_model=List[CreditTransactionResponse])
+async def get_credits_transactions(request: Request):
+    user = await get_current_user(request)
+    transactions = await db.credit_transactions.find(
+        {"user_id": user["user_id"]},
+        {"_id": 0},
+    ).sort("created_at", -1).limit(50).to_list(50)
+    return transactions
+
+
+# ---- Phase 2: wallet -> credits purchase ----
+# One-directional by construction: this is the only route that moves value
+# between wallet_balance and credits_balance, and it only ever debits
+# wallet_balance / credits grant_credits(). There is no route, here or
+# anywhere else in this file, that increments wallet_balance from
+# credits_balance - do not add one.
+#
+# Currently USDT-only. USDT is the only wallet currency this codebase
+# already treats as $-pegged (see the 100.0 starting balance vs 0.001 BTC /
+# 0.01 ETH), and the locked 100 credits = $1 exchange rate needs a USD
+# value to apply to. Supporting BTC/ETH purchases would need a live price
+# feed, which doesn't exist yet - flagged rather than guessed at.
+
+@api_router.get("/credits/packs")
+async def get_credit_packs():
+    return {
+        "currency": "USDT",
+        "credits_per_usd": CREDITS_PER_USD,
+        "packs": [
+            {"amount_usdt": amt, "credits": amt * CREDITS_PER_USD}
+            for amt in CREDIT_PACKS_USDT
+        ],
+    }
+
+
+@api_router.post("/credits/purchase")
+async def purchase_credits(purchase_data: BuyCreditsRequest, request: Request):
+    user = await get_current_user(request)
+
+    requested_usdt = round(purchase_data.amount_usdt, 2)
+    if requested_usdt <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+
+    # Floor to a whole number of credits, then charge exactly what that many
+    # credits cost - never round in the user's favor (free credits) or the
+    # house's favor (overcharging a fraction of a cent past what the
+    # displayed credit amount implies).
+    credits_to_grant = int(requested_usdt * CREDITS_PER_USD)
+    if credits_to_grant < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Minimum purchase is {1 / CREDITS_PER_USD:.2f} USDT (1 credit)",
+        )
+    actual_cost_usdt = credits_to_grant / CREDITS_PER_USD
+
+    # Atomic, conditional debit: the filter re-checks the balance at update
+    # time, so two concurrent purchase requests can't both read a
+    # sufficient balance and then both deduct - the second one simply
+    # doesn't match once the first has applied.
+    updated_user = await db.users.find_one_and_update(
+        {"user_id": user["user_id"], "wallet_balance.USDT": {"$gte": actual_cost_usdt}},
+        {"$inc": {"wallet_balance.USDT": -actual_cost_usdt}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated_user is None:
+        raise HTTPException(status_code=400, detail="Insufficient USDT balance")
+
+    wallet_tx_id = f"tx_{uuid.uuid4().hex[:12]}"
+    await db.transactions.insert_one({
+        "tx_id": wallet_tx_id,
+        "user_id": user["user_id"],
+        "tx_type": "credits_purchase",
+        "amount": -actual_cost_usdt,
+        "currency": "USDT",
+        "status": "completed",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    try:
+        await grant_credits(
+            user["user_id"],
+            credits_to_grant,
+            "purchase",
+            reference_id=wallet_tx_id,
+            metadata={"usdt_spent": actual_cost_usdt},
+        )
+    except HTTPException:
+        # The wallet debit above already succeeded; grant_credits failing
+        # (only possible if the user vanished between the debit and here)
+        # would otherwise leave USDT deducted with nothing credited. Refund
+        # it. This is a compensating action, not a two-phase commit - this
+        # deployment's MongoDB isn't assumed to be a replica set, so we
+        # can't wrap both writes in a real multi-document transaction.
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$inc": {"wallet_balance.USDT": actual_cost_usdt}},
+        )
+        await db.transactions.insert_one({
+            "tx_id": f"tx_{uuid.uuid4().hex[:12]}",
+            "user_id": user["user_id"],
+            "tx_type": "credits_purchase_refund",
+            "amount": actual_cost_usdt,
+            "currency": "USDT",
+            "status": "completed",
+            "related_tx_id": wallet_tx_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        raise
+
+    final_user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return {
+        "success": True,
+        "credits_purchased": credits_to_grant,
+        "cost_usdt": actual_cost_usdt,
+        "wallet_balance": final_user.get("wallet_balance"),
+        "credits_balance": final_user.get("credits_balance"),
+        "tx_id": wallet_tx_id,
+    }
+
+
+# ---- Phase 3: generic credit-spend mechanism ----
+# The ONE reusable spend path. Every gated feature in Phase 4 must call
+# spend_credits() (or hit POST /credits/spend) rather than writing its own
+# balance-check-and-deduct logic, so cost lookup, the atomic debit, the
+# ledger row, and the insufficient-credits response shape are guaranteed
+# identical everywhere a feature gets gated.
+
+async def spend_credits(
+    user_id: str,
+    feature_key: str,
+    reference_id: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> dict:
+    """Look up feature_key's cost in credit_feature_costs and debit it
+    atomically via grant_credits. Raises HTTPException(500) if the feature
+    has no configured cost (Phase 4 must price a feature here before
+    gating it), or HTTPException(402) with a structured body if the user
+    doesn't have enough credits - the frontend can key off
+    detail.error == "insufficient_credits" to show a buy-more-credits
+    prompt instead of a bare error."""
+    cost = await get_credit_feature_cost(feature_key)
+    if cost is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No credit cost configured for feature '{feature_key}'",
+        )
+    if cost <= 0:
+        # Cost intentionally set to 0 (e.g. admin comped it) - nothing to
+        # deduct, nothing to ledger.
+        return {"success": True, "feature_key": feature_key, "cost": 0, "free": True}
+
+    full_metadata = {"feature_key": feature_key, **(metadata or {})}
+    try:
+        ledger_entry = await grant_credits(
+            user_id,
+            -cost,
+            "spend",
+            reference_id=reference_id or feature_key,
+            metadata=full_metadata,
+        )
+    except HTTPException as e:
+        if e.status_code == 400 and e.detail == "Insufficient credits":
+            current = await db.users.find_one({"user_id": user_id}, {"_id": 0, "credits_balance": 1})
+            current_balance = current.get("credits_balance", 0) if current else 0
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "insufficient_credits",
+                    "feature_key": feature_key,
+                    "cost": cost,
+                    "credits_balance": current_balance,
+                    "shortfall": cost - current_balance,
+                },
+            )
+        raise
+
+    return {
+        "success": True,
+        "feature_key": feature_key,
+        "cost": cost,
+        "credits_balance": ledger_entry["resulting_balance"],
+        "tx_id": ledger_entry["tx_id"],
+    }
+
+
+@api_router.post("/credits/spend")
+async def spend_credits_endpoint(spend_data: SpendCreditsRequest, request: Request):
+    user = await get_current_user(request)
+    return await spend_credits(
+        user["user_id"],
+        spend_data.feature_key,
+        reference_id=spend_data.reference_id,
+        metadata=spend_data.metadata,
+    )
+
+
+# ---- Phase 3: admin management of credit_feature_costs ----
+# "All credit costs are configurable, not hardcoded" - this is how pricing
+# changes without a deploy. Phase 4 gated features will each need a row
+# here before they can be gated (spend_credits 500s otherwise).
+
+@api_router.get("/admin/credit-feature-costs")
+async def admin_list_credit_feature_costs(request: Request):
+    await get_admin_user(request)
+    costs = await db.credit_feature_costs.find({}, {"_id": 0}).sort("feature_key", 1).to_list(500)
+    return costs
+
+
+@api_router.put("/admin/credit-feature-costs/{feature_key}")
+async def admin_set_credit_feature_cost(feature_key: str, update: CreditFeatureCostUpdate, request: Request):
+    await get_admin_user(request)
+    if update.cost < 0:
+        raise HTTPException(status_code=400, detail="Cost must be >= 0")
+
+    await db.credit_feature_costs.update_one(
+        {"feature_key": feature_key},
+        {
+            "$set": {
+                "feature_key": feature_key,
+                "cost": update.cost,
+                "category": update.category,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+        upsert=True,
+    )
+    return {"success": True}
+
+# ============= PHASE 4a: ANALYSIS & POST-GAME TOOLS =============
+# Feature keys introduced in this phase (price each via
+# PUT /admin/credit-feature-costs/{feature_key} - nothing here is
+# hardcoded, per the locked "all credit costs are configurable" decision):
+#   - "game_review"          per-user unlock of the standard depth-12
+#                             Stockfish review for one completed game
+#   - "deep_analysis"        per-user unlock of a deeper (depth 20)
+#                             re-analysis of one of the user's own
+#                             completed games
+#   - "pgn_deep_analysis"    deep analysis of an arbitrary imported PGN,
+#                             charged once per distinct PGN per user
+#   - "opening_explorer_deep" per-query cost for opening-explorer lookups
+#                             beyond the free shallow depth
+#
+# None of these have a cost until an admin sets one via the endpoint
+# above - spend_credits() 500s on an unpriced feature_key by design, so a
+# feature can't accidentally go live unpriced.
+
+DEEP_ANALYSIS_DEPTH = 20
+PGN_ANALYSIS_DEPTH = 18
+# First 3 full moves (6 ply) of the in-house opening explorer are free;
+# looking deeper than that costs credits. "Basic depth" per the spec.
+OPENING_EXPLORER_FREE_PLY = 6
+
+
+async def _claim_unlock(
+    collection,
+    user_id: str,
+    doc_key: dict,
+    feature_key: str,
+    reference_id: Optional[str] = None,
+) -> dict:
+    """Atomically claim a one-time-per-user unlock recorded in `collection`
+    (keyed on user_id + doc_key), charging `feature_key` credits exactly
+    once for it. Built for features where the underlying computation may
+    be shared/cached (e.g. a game's Stockfish review), but each user
+    should still only ever be billed once for unlocking access to it.
+
+    The (user_id + doc_key) slot is claimed with an atomic insert BEFORE
+    credits are charged, so two concurrent requests for the same unlock
+    can't both observe "not yet unlocked" and both get charged. If the
+    charge then fails (e.g. insufficient credits), the claim is rolled
+    back immediately so the user isn't left locked out without having
+    paid.
+
+    Returns {"already_unlocked": bool, "unlock": dict, "spend": dict|None}.
+    Raises whatever spend_credits() raises (e.g. HTTPException 402) if a
+    fresh charge is attempted and fails.
+    """
+    existing = await collection.find_one({"user_id": user_id, **doc_key}, {"_id": 0})
+    if existing:
+        return {"already_unlocked": True, "unlock": existing, "spend": None}
+
+    claim_doc = {
+        "user_id": user_id,
+        **doc_key,
+        "tx_id": None,
+        "claimed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        await collection.insert_one(dict(claim_doc))
+    except DuplicateKeyError:
+        # Lost the race to a concurrent request for the same unlock -
+        # that request is the one paying for it, not us.
+        existing = await collection.find_one({"user_id": user_id, **doc_key}, {"_id": 0})
+        return {"already_unlocked": True, "unlock": existing, "spend": None}
+
+    try:
+        spend_result = await spend_credits(user_id, feature_key, reference_id=reference_id, metadata=doc_key)
+    except HTTPException:
+        await collection.delete_one({"user_id": user_id, **doc_key})
+        raise
+
+    await collection.update_one(
+        {"user_id": user_id, **doc_key},
+        {"$set": {"tx_id": spend_result["tx_id"]}},
+    )
+    claim_doc["tx_id"] = spend_result["tx_id"]
+    return {"already_unlocked": False, "unlock": claim_doc, "spend": spend_result}
+
+
+def _parse_pgn_to_uci_moves(pgn_text: str):
+    """Parse a PGN string into (uci_moves, starting_fen). starting_fen is
+    None when the game starts from the standard position. Raises
+    ValueError on unparseable PGN or a PGN with no moves."""
+    import chess
+    import chess.pgn
+
+    game = chess.pgn.read_game(io.StringIO(pgn_text))
+    if game is None:
+        raise ValueError("Could not parse PGN")
+
+    board = game.board()
+    starting_fen = board.fen() if board.fen() != chess.Board().fen() else None
+
+    uci_moves = []
+    node = game
+    while node.variations:
+        next_node = node.variations[0]
+        uci_moves.append(next_node.move.uci())
+        node = next_node
+
+    if not uci_moves:
+        raise ValueError("PGN has no moves to analyze")
+
+    return uci_moves, starting_fen
+
+
+# ---- Deep/cloud analysis on the user's own saved games ----
+# Distinct from the standard /games/{game_id}/analysis review above: this
+# runs at a much higher depth and is billed separately (feature key
+# "deep_analysis") and per-user, since deep analysis of a specific game
+# is framed in the spec as an upgrade on top of the basic review, not a
+# replacement for it. Restricted to games the requester actually played
+# in - "saved games" means the user's own games, not spectated ones.
+
+@api_router.post("/games/{game_id}/deep-analysis")
+async def deep_analyze_game(game_id: str, request: Request):
+    user = await get_current_user(request)
+    game = await db.games.find_one({"game_id": game_id}, {"_id": 0})
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    if game.get("status") != "completed":
+        raise HTTPException(status_code=403, detail="Deep analysis is only available for completed games")
+
+    participant_ids = {
+        (game.get("white_player") or {}).get("user_id"),
+        (game.get("black_player") or {}).get("user_id"),
+    }
+    if user["user_id"] not in participant_ids:
+        raise HTTPException(status_code=403, detail="Deep analysis is only available for your own games")
+
+    moves = game.get("moves", [])
+    if not moves:
+        raise HTTPException(status_code=400, detail="Game has no moves to analyze")
+
+    claim = await _claim_unlock(
+        db.deep_analysis_unlocks, user["user_id"], {"game_id": game_id},
+        "deep_analysis", reference_id=game_id,
+    )
+
+    if game.get("deep_analysis"):
+        return {"success": True, "analysis": game["deep_analysis"], "already_unlocked": claim["already_unlocked"]}
+
+    if not STOCKFISH_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Stockfish engine not available")
+
+    starting_fen = game.get("initial_fen") if game.get("initial_fen") else None
+    lock = _get_analysis_lock(f"{game_id}:deep")
+    async with lock:
+        fresh_game = await db.games.find_one({"game_id": game_id}, {"_id": 0, "deep_analysis": 1})
+        if fresh_game and fresh_game.get("deep_analysis"):
+            return {"success": True, "analysis": fresh_game["deep_analysis"], "already_unlocked": claim["already_unlocked"]}
+        analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, DEEP_ANALYSIS_DEPTH)
+
+    if not analysis.get("engine_available"):
+        raise HTTPException(status_code=503, detail=analysis.get("error", "Deep analysis failed"))
+
+    analysis_doc = {
+        "analysis_id": f"dan_{uuid.uuid4().hex[:12]}",
+        "game_id": game_id,
+        "depth": analysis.get("depth", DEEP_ANALYSIS_DEPTH),
+        "summary": analysis.get("summary"),
+        "moves": analysis.get("moves"),
+        "engine_available": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.games.update_one({"game_id": game_id}, {"$set": {"deep_analysis": analysis_doc}})
+    return {"success": True, "analysis": analysis_doc, "already_unlocked": claim["already_unlocked"]}
+
+
+@api_router.get("/games/{game_id}/deep-analysis")
+async def get_deep_analysis(game_id: str, request: Request):
+    """Retrieve deep analysis for a game the user has already unlocked.
+    Read-only - never spends credits. Unlock/compute happens via POST."""
+    user = await get_current_user(request)
+    unlock = await db.deep_analysis_unlocks.find_one(
+        {"user_id": user["user_id"], "game_id": game_id}, {"_id": 0}
+    )
+    if not unlock:
+        cost = await get_credit_feature_cost("deep_analysis")
+        raise HTTPException(status_code=402, detail={
+            "error": "not_unlocked",
+            "feature_key": "deep_analysis",
+            "cost": cost,
+        })
+
+    game = await db.games.find_one({"game_id": game_id}, {"_id": 0, "deep_analysis": 1})
+    if not game or not game.get("deep_analysis"):
+        raise HTTPException(status_code=404, detail="Deep analysis not yet computed - POST to this URL to run it")
+    return {"analysis": game["deep_analysis"]}
+
+
+# ---- Deep/cloud analysis on imported PGNs ----
+# For arbitrary PGNs pasted into /import-pgn that aren't a StakeChess
+# game - so there's no game_id or participant check, just the pasted PGN
+# text itself. Charged once per distinct PGN per user (keyed by a hash of
+# the PGN text); re-submitting the exact same PGN returns the cached
+# result for free rather than charging again.
+
+@api_router.post("/pgn/analyze")
+async def analyze_imported_pgn(analyze_data: PGNAnalyzeRequest, request: Request):
+    user = await get_current_user(request)
+
+    pgn_text = (analyze_data.pgn or "").strip()
+    if not pgn_text:
+        raise HTTPException(status_code=400, detail="PGN text is required")
+
+    try:
+        uci_moves, starting_fen = _parse_pgn_to_uci_moves(pgn_text)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    pgn_hash = hashlib.sha256(pgn_text.encode("utf-8")).hexdigest()[:24]
+
+    claim = await _claim_unlock(
+        db.pgn_analysis_cache, user["user_id"], {"pgn_hash": pgn_hash},
+        "pgn_deep_analysis", reference_id=pgn_hash,
+    )
+
+    if claim["already_unlocked"] and claim["unlock"].get("analysis"):
+        return {"success": True, "analysis": claim["unlock"]["analysis"], "cached": True}
+
+    if not STOCKFISH_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Stockfish engine not available")
+
+    analysis = await asyncio.to_thread(analyze_game_with_stockfish, uci_moves, starting_fen, PGN_ANALYSIS_DEPTH)
+    if not analysis.get("engine_available"):
+        raise HTTPException(status_code=503, detail=analysis.get("error", "PGN analysis failed"))
+
+    analysis_doc = {
+        "analysis_id": f"pan_{uuid.uuid4().hex[:12]}",
+        "depth": analysis.get("depth", PGN_ANALYSIS_DEPTH),
+        "summary": analysis.get("summary"),
+        "moves": analysis.get("moves"),
+        "engine_available": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.pgn_analysis_cache.update_one(
+        {"user_id": user["user_id"], "pgn_hash": pgn_hash},
+        {"$set": {"analysis": analysis_doc}},
+    )
+    return {"success": True, "analysis": analysis_doc, "cached": False}
+
+
+# ---- Opening explorer ----
+# A basic in-house opening explorer sourced from StakeChess's own
+# completed games (not an external database - there isn't one in this
+# codebase). Queried by a comma-separated UCI move prefix; the first
+# OPENING_EXPLORER_FREE_PLY ply are free, going deeper costs credits per
+# query (feature key "opening_explorer_deep") - there's no persistent
+# unlock here since it's a live query over changing game data, not a
+# one-time compute like the review/analysis features above.
+
+@api_router.get("/opening-explorer")
+async def opening_explorer(request: Request, moves: str = ""):
+    user = await get_current_user(request)
+
+    move_list = [m.strip() for m in moves.split(",") if m.strip()] if moves else []
+    ply = len(move_list)
+
+    spend_result = None
+    if ply > OPENING_EXPLORER_FREE_PLY:
+        spend_result = await spend_credits(
+            user["user_id"],
+            "opening_explorer_deep",
+            reference_id="-".join(move_list) or "start",
+            metadata={"ply": ply, "moves": move_list},
+        )
+
+    # Mongo can't express "array length >= N" with a plain query filter,
+    # so $expr is needed to make sure the game actually has a move at
+    # index `ply` before we look at moves.{ply} below.
+    query: Dict[str, Any] = {
+        "status": "completed",
+        "$expr": {"$gte": [{"$size": {"$ifNull": ["$moves", []]}}, ply + 1]},
+    }
+    for i, mv in enumerate(move_list):
+        query[f"moves.{i}"] = mv
+
+    cursor = db.games.find(
+        query,
+        {"_id": 0, "moves": 1, "result": 1},
+    ).limit(2000)
+
+    next_move_stats: Dict[str, Dict[str, int]] = {}
+    total = 0
+    async for g in cursor:
+        game_moves = g.get("moves", [])
+        if len(game_moves) <= ply:
+            continue
+        next_move = game_moves[ply]
+        stats = next_move_stats.setdefault(
+            next_move, {"games": 0, "white_wins": 0, "black_wins": 0, "draws": 0}
+        )
+        stats["games"] += 1
+        total += 1
+        result = g.get("result")
+        if result == "white":
+            stats["white_wins"] += 1
+        elif result == "black":
+            stats["black_wins"] += 1
+        elif result == "draw":
+            stats["draws"] += 1
+
+    next_moves = [
+        {
+            "move": mv,
+            "games": s["games"],
+            "white_win_pct": round(100 * s["white_wins"] / s["games"], 1),
+            "black_win_pct": round(100 * s["black_wins"] / s["games"], 1),
+            "draw_pct": round(100 * s["draws"] / s["games"], 1),
+        }
+        for mv, s in sorted(next_move_stats.items(), key=lambda kv: -kv[1]["games"])
+    ]
+
+    return {
+        "ply": ply,
+        "total_games": total,
+        "next_moves": next_moves,
+        "free": ply <= OPENING_EXPLORER_FREE_PLY,
+        "free_ply_limit": OPENING_EXPLORER_FREE_PLY,
+        "spend": spend_result,
+    }
 
 # ============= WALLET ROUTES =============
 
@@ -4261,6 +5401,16 @@ async def update_user_settings(user_id: str, request: Request):
         top_level_updates["allow_spectators"] = bool(body["allow_spectators"])
     if "allow_chat_broadcast" in body:
         top_level_updates["allow_chat_broadcast"] = bool(body["allow_chat_broadcast"])
+    if "timezone" in body:
+        tz_name = (body.get("timezone") or "").strip()
+        if tz_name:
+            try:
+                ZoneInfo(tz_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise HTTPException(status_code=400, detail=f"Unknown timezone '{tz_name}'")
+            top_level_updates["timezone"] = tz_name
+        else:
+            top_level_updates["timezone"] = None
 
     if not settings and board_preferences is None and not top_level_updates:
         raise HTTPException(status_code=400, detail="No valid settings provided")
@@ -4570,8 +5720,100 @@ async def admin_update_settings(settings: AdminSettingsUpdate, request: Request)
     
     return {"success": True}
 
+def _puzzle_natural_difficulty(solved_count: int, difficulty_count: int) -> int:
+    """The difficulty tier a user has organically earned through solving
+    puzzles - shared by /puzzles/next and /puzzles/progress so the two
+    can never disagree. Extracted verbatim from the original inline
+    formula in both places, not changed."""
+    difficulty_count = max(1, difficulty_count)
+    return min(difficulty_count, max(1, solved_count // max(1, 10000 // difficulty_count) + 1))
+
+
+def _today_str_for_timezone(tz_name: Optional[str]) -> str:
+    """Today's date (YYYY-MM-DD) in the given IANA timezone, falling back
+    to UTC if tz_name is unset or invalid. Used so daily-reset budgets
+    (Phase 4b puzzle retries/skips) reset at the user's local midnight,
+    not a fixed UTC midnight - a user's timezone is set via
+    PUT /users/{id}/settings and validated with zoneinfo there."""
+    if tz_name:
+        try:
+            return datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# ============= PHASE 4b: PUZZLES & PRACTICE =============
+# Feature keys introduced in this phase (price via
+# PUT /admin/credit-feature-costs/{feature_key}, same as Phase 4a):
+#   - "puzzle_retry"  extra guess after PUZZLE_FREE_DAILY_MISSES wrong
+#                      guesses have already been used today
+#   - "puzzle_skip"   extra puzzle skip after PUZZLE_FREE_DAILY_SKIPS free
+#                      skips have already been used today
+#   - "puzzle_pack"   one-time per-user unlock of a difficulty tier above
+#                      the one the user has naturally earned via solved_count
+#
+# "Extra lives/retries" and "skip tokens" are both modeled as a daily free
+# budget (resets at the user's local midnight - see _today_str_for_timezone -
+# falling back to UTC if they haven't set a timezone) rather than a
+# persistent unlock, since they're consumable actions, not a permanent
+# purchase - unlike "puzzle_pack", which behaves like Phase 4a's unlock
+# features (buy once, keep forever) since the spec frames packs as
+# something you own.
+PUZZLE_FREE_DAILY_MISSES = 5
+PUZZLE_FREE_DAILY_SKIPS = 5
+
+
+async def _consume_daily_budget(user: dict, budget_key: str, free_limit: int, feature_key: str, reference_id: str, collection=None) -> dict:
+    """Shared daily-free-then-paid budget. Originally built for puzzle
+    retries/skips (`collection` defaults to db.puzzle_progress so those
+    existing call sites are unaffected); Phase 4c reuses it for extra
+    challenge invites via a different collection so the two budgets never
+    collide. Stored as f"{budget_key}_today" / f"{budget_key}_date" on
+    whatever collection is passed, reset whenever the stored date isn't
+    "today" in the user's own timezone (user["timezone"], falling back to
+    UTC if unset).
+
+    Call this BEFORE the action it gates. If the day's free budget is
+    already used up, it charges `feature_key` credits - raising
+    HTTPException(402) exactly like spend_credits() does - before letting
+    the caller proceed. It does NOT increment the counter itself; call
+    _record_daily_usage after the gated action actually happens, so a
+    request that 402s here never counts against the budget.
+    """
+    collection = db.puzzle_progress if collection is None else collection
+    user_id = user["user_id"]
+    today = _today_str_for_timezone(user.get("timezone"))
+    progress = await collection.find_one({"user_id": user_id}, {"_id": 0}) or {}
+    used_today = progress.get(f"{budget_key}_today", 0) if progress.get(f"{budget_key}_date") == today else 0
+
+    if used_today < free_limit:
+        return {"paid": False, "used_today": used_today, "free_limit": free_limit}
+
+    spend_result = await spend_credits(user_id, feature_key, reference_id=reference_id, metadata={"budget_key": budget_key})
+    return {"paid": True, "used_today": used_today, "free_limit": free_limit, "spend": spend_result}
+
+
+async def _record_daily_usage(user: dict, budget_key: str, collection=None) -> None:
+    """Increments today's usage counter for _consume_daily_budget - call
+    only after the gated action actually happened. Uses the same per-user
+    localized "today" as _consume_daily_budget so the two never disagree
+    about which day a given action falls on. `collection` must match
+    whatever was passed to the corresponding _consume_daily_budget call."""
+    collection = db.puzzle_progress if collection is None else collection
+    user_id = user["user_id"]
+    today = _today_str_for_timezone(user.get("timezone"))
+    progress = await collection.find_one({"user_id": user_id}, {"_id": 0}) or {}
+    used_today = progress.get(f"{budget_key}_today", 0) if progress.get(f"{budget_key}_date") == today else 0
+    await collection.update_one(
+        {"user_id": user_id},
+        {"$set": {f"{budget_key}_date": today, f"{budget_key}_today": used_today + 1}},
+        upsert=True,
+    )
+
+
 @api_router.get("/puzzles/next", response_model=PuzzleResponse)
-async def get_next_puzzle(request: Request):
+async def get_next_puzzle(request: Request, difficulty: Optional[int] = None):
     user = await get_current_user(request)
     settings = await db.settings.find_one({"type": "platform"}, {"_id": 0}) or {}
     await seed_puzzles_if_needed(settings)
@@ -4579,14 +5821,42 @@ async def get_next_puzzle(request: Request):
     progress = await db.puzzle_progress.find_one({"user_id": user["user_id"]}) or {}
     solved_count = progress.get("solved_count", 0)
     difficulty_count = max(1, settings.get("puzzle_difficulty_count", 10))
-    difficulty = min(difficulty_count, max(1, solved_count // max(1, 10000 // difficulty_count) + 1))
+    natural_difficulty = _puzzle_natural_difficulty(solved_count, difficulty_count)
 
-    total_matching = await db.puzzles.count_documents({"difficulty": difficulty})
+    # Phase 4b: "themed puzzle packs" simplified to paid access to a
+    # difficulty tier above the one the user has naturally earned yet.
+    # Tiers at or below natural_difficulty are always free (already
+    # earned by solving). Requesting a tier above it is a one-time
+    # per-user unlock, same claim-then-charge pattern as Phase 4a.
+    if difficulty is not None:
+        if difficulty < 1 or difficulty > difficulty_count:
+            raise HTTPException(status_code=400, detail=f"difficulty must be between 1 and {difficulty_count}")
+        if difficulty > natural_difficulty:
+            await _claim_unlock(
+                db.puzzle_pack_unlocks, user["user_id"], {"difficulty": difficulty},
+                "puzzle_pack", reference_id=str(difficulty),
+            )
+        selected_difficulty = difficulty
+    else:
+        selected_difficulty = natural_difficulty
+
+    # Phase 4b: skip tokens. Requesting a new puzzle while the user's most
+    # recent attempt is still unsolved counts as skipping it. The very
+    # first puzzle a user ever requests, or requesting a new one right
+    # after solving the last, is never a skip.
+    last_attempt = await db.puzzle_attempts.find_one(
+        {"user_id": user["user_id"]}, {"_id": 0}, sort=[("created_at", -1)]
+    )
+    is_skip = bool(last_attempt) and not last_attempt.get("completed")
+    if is_skip:
+        await _consume_daily_budget(user, "skips", PUZZLE_FREE_DAILY_SKIPS, "puzzle_skip", reference_id=last_attempt["attempt_id"])
+
+    total_matching = await db.puzzles.count_documents({"difficulty": selected_difficulty})
     if total_matching == 0:
         raise HTTPException(status_code=404, detail="No puzzles available for this difficulty")
 
     selected_index = random.randrange(total_matching)
-    puzzle_cursor = db.puzzles.find({"difficulty": difficulty}, {"_id": 0}).skip(selected_index).limit(1)
+    puzzle_cursor = db.puzzles.find({"difficulty": selected_difficulty}, {"_id": 0}).skip(selected_index).limit(1)
     puzzles = await puzzle_cursor.to_list(1)
     if not puzzles:
         raise HTTPException(status_code=404, detail="No puzzle found")
@@ -4622,10 +5892,46 @@ async def get_next_puzzle(request: Request):
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
 
+    # Only record the skip as "used" once a replacement puzzle has
+    # actually been served - a request that 402'd above never gets here.
+    if is_skip:
+        await _record_daily_usage(user, "skips")
+
     response_doc = dict(puzzle_doc)
     response_doc["fen"] = display_fen
     response_doc["attempt_id"] = attempt_id
     return PuzzleResponse(**response_doc)
+
+
+@api_router.get("/puzzles/packs")
+async def list_puzzle_packs(request: Request):
+    """Difficulty tiers available as Phase 4b 'packs', with unlock status
+    and price, so the frontend can show a pack-browsing screen instead of
+    the user discovering paid tiers only by hitting a 402."""
+    user = await get_current_user(request)
+    settings = await db.settings.find_one({"type": "platform"}, {"_id": 0}) or {}
+    difficulty_count = max(1, settings.get("puzzle_difficulty_count", 10))
+
+    progress = await db.puzzle_progress.find_one({"user_id": user["user_id"]}, {"_id": 0}) or {}
+    natural_difficulty = _puzzle_natural_difficulty(progress.get("solved_count", 0), difficulty_count)
+
+    unlocked_tiers = {
+        doc["difficulty"]
+        async for doc in db.puzzle_pack_unlocks.find({"user_id": user["user_id"]}, {"_id": 0, "difficulty": 1})
+    }
+    cost = await get_credit_feature_cost("puzzle_pack")
+
+    packs = []
+    for tier in range(1, difficulty_count + 1):
+        earned = tier <= natural_difficulty
+        packs.append({
+            "difficulty": tier,
+            "unlocked": earned or tier in unlocked_tiers,
+            "earned": earned,
+            "cost": None if earned else cost,
+        })
+    return {"packs": packs, "natural_difficulty": natural_difficulty}
+
 
 @api_router.get("/puzzles/progress", response_model=PuzzleProgressResponse)
 async def get_puzzle_progress(request: Request):
@@ -4635,7 +5941,7 @@ async def get_puzzle_progress(request: Request):
     solved_count = progress.get("solved_count", 0)
     earned_rating = progress.get("earned_rating", 0)
     difficulty_count = max(1, settings.get("puzzle_difficulty_count", 10))
-    current_difficulty = min(difficulty_count, max(1, solved_count // max(1, 10000 // difficulty_count) + 1))
+    current_difficulty = _puzzle_natural_difficulty(solved_count, difficulty_count)
     recent = progress.get("recent_solved", [])[-10:]
 
     return PuzzleProgressResponse(
@@ -4644,6 +5950,29 @@ async def get_puzzle_progress(request: Request):
         current_difficulty=current_difficulty,
         recent_solved=recent
     )
+
+
+@api_router.get("/puzzles/budget-status")
+async def get_puzzle_budget_status(request: Request):
+    """Phase 5: read-only preview of today's free retry/skip budgets and
+    what the next one beyond them would cost - lets the frontend show an
+    ambient 'X free skips left today' instead of the user only learning
+    the price from a 402 toast after they've already run out. Same
+    read-without-charging shape as get_pgn_import_status. Never
+    increments or charges."""
+    user = await get_current_user(request)
+    today = _today_str_for_timezone(user.get("timezone"))
+    progress = await db.puzzle_progress.find_one({"user_id": user["user_id"]}, {"_id": 0}) or {}
+
+    def _status(budget_key, free_limit):
+        used_today = progress.get(f"{budget_key}_today", 0) if progress.get(f"{budget_key}_date") == today else 0
+        return {"used_today": used_today, "free_limit": free_limit, "remaining_free": max(0, free_limit - used_today)}
+
+    retries = _status("misses", PUZZLE_FREE_DAILY_MISSES)
+    skips = _status("skips", PUZZLE_FREE_DAILY_SKIPS)
+    retries["cost"] = await get_credit_feature_cost("puzzle_retry")
+    skips["cost"] = await get_credit_feature_cost("puzzle_skip")
+    return {"retries": retries, "skips": skips}
 
 @api_router.post("/puzzles/attempts/{attempt_id}/move")
 async def submit_puzzle_move(attempt_id: str, move_request: PuzzleMoveRequest, request: Request):
@@ -4683,13 +6012,25 @@ async def submit_puzzle_move(attempt_id: str, move_request: PuzzleMoveRequest, r
     expected = normalize(solution[idx])
 
     if submitted != expected:
+        # Phase 4b: extra retries after the daily free ones run out. The
+        # daily budget only counts wrong guesses (see PUZZLE_FREE_DAILY_MISSES) -
+        # this consumes a "life" for a wrong answer, or charges credits if
+        # the day's free lives are already spent. Raises HTTPException(402)
+        # if the user is out of free retries and can't afford another.
+        budget_result = await _consume_daily_budget(user, "misses", PUZZLE_FREE_DAILY_MISSES, "puzzle_retry", reference_id=attempt_id)
+        await _record_daily_usage(user, "misses")
+
         # Wrong guess: ply_index does not advance and the expected move is
         # never revealed, so a wrong answer teaches the client nothing
         # about the real solution beyond "not that one".
+        message = "Incorrect. Try one of the hints or review the position."
+        if budget_result["paid"]:
+            message = f"Incorrect (out of free retries today - {budget_result['spend']['cost']} credits spent for this attempt)."
         return {
             "correct": False,
             "puzzle_complete": False,
-            "message": "Incorrect. Try one of the hints or review the position.",
+            "message": message,
+            "retry_charged": budget_result["paid"],
         }
 
     idx += 1
@@ -4786,6 +6127,450 @@ async def admin_security_alerts(request: Request):
     
     alerts = await db.security_alerts.find({}, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
     return alerts
+
+# ============= PHASE 4d: STUDY & CONTENT =============
+# Feature key introduced in this phase (price via
+# PUT /admin/credit-feature-costs/{feature_key}, same as 4a/4b/4c):
+#   - "pgn_import_extra"  one imported PGN beyond the free monthly cap
+#
+# Scope note: the other two Phase 4d items from the spec - "premium/curated
+# studies from titled players" and "opening trainer courses" - are
+# intentionally NOT gated here. Neither has a real feature behind it yet:
+# studies.js is 12 generic YouTube-search-query entries with no curator/
+# titled-player attribution or premium flag, and there is no opening-trainer
+# page, route, or data model anywhere in the app. Gating either now would
+# mean inventing the underlying feature, not wiring credits onto an
+# existing one, so both are deferred until that product work exists. Only
+# the PGN-import cap is implemented below.
+#
+# "Import" is defined as a successful parse via POST /pgn/import - the
+# frontend calls this once ImportPGN.jsx has parsed a PGN into a valid game
+# (see handleParse), not on every keystroke/attempt. Modeled as a
+# calendar-month free budget (resets on the user's local 1st of the month,
+# mirroring _today_str_for_timezone's per-user-timezone approach from Phase
+# 4b) rather than a permanent unlock, since importing is a repeatable
+# consumable action like puzzle retries/skips, not a one-time purchase like
+# puzzle_pack.
+PGN_FREE_MONTHLY_IMPORTS = 5
+
+
+def _current_month_str_for_timezone(tz_name: Optional[str]) -> str:
+    """This month (YYYY-MM) in the given IANA timezone, falling back to UTC
+    if tz_name is unset or invalid. Same fallback behavior as
+    _today_str_for_timezone, just month-grained instead of day-grained."""
+    if tz_name:
+        try:
+            return datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m")
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+async def _consume_monthly_budget(user: dict, budget_key: str, free_limit: int, feature_key: str, reference_id: str, collection=None) -> dict:
+    """Monthly counterpart to Phase 4b's _consume_daily_budget - same
+    free-then-paid shape, just keyed on the user's current calendar month
+    (f"{budget_key}_month" / f"{budget_key}_count") instead of a day.
+
+    Call this BEFORE the action it gates. If this month's free budget is
+    already used up, it charges `feature_key` credits - raising
+    HTTPException(402) exactly like spend_credits() does - before letting
+    the caller proceed. It does NOT increment the counter itself; call
+    _record_monthly_usage after the gated action actually happens, so a
+    request that 402s here never counts against the budget.
+    """
+    user_id = user["user_id"]
+    this_month = _current_month_str_for_timezone(user.get("timezone"))
+    progress = await collection.find_one({"user_id": user_id}, {"_id": 0}) or {}
+    used_this_month = progress.get(f"{budget_key}_count", 0) if progress.get(f"{budget_key}_month") == this_month else 0
+
+    if used_this_month < free_limit:
+        return {"paid": False, "used_this_month": used_this_month, "free_limit": free_limit}
+
+    spend_result = await spend_credits(user_id, feature_key, reference_id=reference_id, metadata={"budget_key": budget_key})
+    return {"paid": True, "used_this_month": used_this_month, "free_limit": free_limit, "spend": spend_result}
+
+
+async def _record_monthly_usage(user: dict, budget_key: str, collection=None) -> None:
+    """Increments this month's usage counter for _consume_monthly_budget -
+    call only after the gated action actually happened. Uses the same
+    per-user localized "this month" as _consume_monthly_budget so the two
+    never disagree about which month a given action falls in."""
+    user_id = user["user_id"]
+    this_month = _current_month_str_for_timezone(user.get("timezone"))
+    progress = await collection.find_one({"user_id": user_id}, {"_id": 0}) or {}
+    used_this_month = progress.get(f"{budget_key}_count", 0) if progress.get(f"{budget_key}_month") == this_month else 0
+    await collection.update_one(
+        {"user_id": user_id},
+        {"$set": {f"{budget_key}_month": this_month, f"{budget_key}_count": used_this_month + 1}},
+        upsert=True,
+    )
+
+
+@api_router.post("/pgn/import")
+async def import_pgn(import_data: PGNImportRequest, request: Request):
+    """Record one PGN import against the user's free monthly cap, charging
+    `pgn_import_extra` credits once that cap is used up this month. Call
+    this after ImportPGN.jsx has successfully parsed a PGN, not before -
+    a PGN that fails to parse was never actually imported and shouldn't
+    cost anything or count against the cap.
+
+    Raises HTTPException(402) via spend_credits() (detail.error ==
+    "insufficient_credits") if the free cap is used up and the user can't
+    afford pgn_import_extra - the frontend should route that into the
+    Buy Credits flow like every other gated feature, not just error out.
+    """
+    user = await get_current_user(request)
+    reference_id = import_data.reference_id or str(uuid.uuid4())
+
+    budget_result = await _consume_monthly_budget(
+        user,
+        "imports",
+        PGN_FREE_MONTHLY_IMPORTS,
+        "pgn_import_extra",
+        reference_id=reference_id,
+        collection=db.pgn_import_usage,
+    )
+    await _record_monthly_usage(user, "imports", collection=db.pgn_import_usage)
+
+    return {
+        "success": True,
+        "paid": budget_result["paid"],
+        "used_this_month": budget_result["used_this_month"] + 1,
+        "free_limit": budget_result["free_limit"],
+        "credits_charged": budget_result["spend"]["cost"] if budget_result["paid"] else 0,
+        "credits_balance": budget_result["spend"]["credits_balance"] if budget_result["paid"] else None,
+    }
+
+
+@api_router.get("/pgn/import/status")
+async def get_pgn_import_status(request: Request):
+    """Read-only - lets the frontend show 'X of Y free imports left this
+    month' before the user commits to importing, same spirit as Phase 5's
+    'show cost before the user commits'. Never charges or increments."""
+    user = await get_current_user(request)
+    this_month = _current_month_str_for_timezone(user.get("timezone"))
+    progress = await db.pgn_import_usage.find_one({"user_id": user["user_id"]}, {"_id": 0}) or {}
+    used_this_month = progress.get("imports_count", 0) if progress.get("imports_month") == this_month else 0
+    cost = await get_credit_feature_cost("pgn_import_extra")
+    return {
+        "used_this_month": used_this_month,
+        "free_limit": PGN_FREE_MONTHLY_IMPORTS,
+        "remaining_free": max(0, PGN_FREE_MONTHLY_IMPORTS - used_this_month),
+        "extra_import_cost": cost,
+    }
+
+
+@api_router.get("/credits/feature-costs/{feature_key}")
+async def get_feature_cost_public(feature_key: str, request: Request):
+    """Phase 5: generic 'show its cost before the user commits' lookup for
+    ANY gated feature - a lightweight companion to spend_credits() so a new
+    gated action never has to grow its own bespoke cost-preview endpoint
+    (Phase 4a-4d each did this ad hoc via /puzzles/packs,
+    /pgn/import/status, etc; this is the reusable version for Phase 4e and
+    beyond). Auth-only, same as every other /credits/* endpoint - cost
+    numbers aren't sensitive, but there's no reason to expose this
+    unauthenticated either. Returns cost: None for an unpriced feature_key
+    rather than 500ing, since "not priced yet" is a valid answer for a
+    preview call (unlike spend_credits(), which must hard-fail if it were
+    ever asked to actually charge an unpriced feature)."""
+    await get_current_user(request)
+    cost = await get_credit_feature_cost(feature_key)
+    return {"feature_key": feature_key, "cost": cost}
+
+
+# ============= PHASE 4e: UTILITY =============
+# Feature keys introduced in this phase (price via
+# PUT /admin/credit-feature-costs/{feature_key}, same as 4a/4b/4c/4d):
+#   - "takeback_token"      undo your own last move
+#   - "extra_time"          add EXTRA_TIME_SECONDS to your own clock
+#   - "custom_clock_preset" save one custom time control on the standalone
+#                            Chess Clock beyond CUSTOM_CLOCK_PRESET_FREE_LIMIT
+#
+# Casual-only scope note: the spec's locked decision is "casual games
+# only, structurally impossible in a staked game" - literally
+# stake_amount == 0, the same field Phase 4c's rematch_token already
+# gates on. takeback_token and extra_time both use that same check and
+# only that check, per explicit confirmation: tournament games are NOT
+# separately excluded, even though they also carry stake_amount == 0 in
+# this codebase (see create_tournament_game). A tournament game is
+# eligible for takeback/extra-time exactly when any other game is -
+# stake_amount == 0.
+EXTRA_TIME_SECONDS = 60
+CUSTOM_CLOCK_PRESET_FREE_LIMIT = 3
+
+
+def _require_casual_untracked_game(game: dict) -> None:
+    """Shared guard for takeback_token and extra_time - raises 400 unless
+    the game is unstaked (stake_amount == 0), matching the spec's literal
+    "casual games only" decision. Tournament games are not separately
+    excluded - see the Phase 4e scope note above."""
+    if game.get("stake_amount", 0) > 0:
+        raise HTTPException(status_code=400, detail="This action is only available in casual (non-staked) games")
+
+
+@api_router.post("/games/{game_id}/takeback")
+async def request_takeback(game_id: str, request: Request):
+    """Phase 4e: spend a 'takeback token' to instantly undo your own last
+    move. Casual (unstaked) games only (see _require_casual_untracked_game).
+
+    Scope: this undoes exactly one ply - your own last move - and only
+    while it's still your opponent's turn to reply (i.e. before they've
+    moved again). It cannot be used to undo an opponent's move, and it
+    cannot reach further back than the single most recent move. This
+    keeps the semantics simple (no risk of un-defining what "current
+    state" even means several moves deep) and matches the everyday sense
+    of "let me take that back" - catching your own blunder immediately,
+    not rewriting history after the game has moved on.
+    """
+    user = await get_current_user(request)
+    game = await db.games.find_one({"game_id": game_id}, {"_id": 0})
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    if game.get("status") != "active":
+        raise HTTPException(status_code=400, detail="Game is not active")
+    _require_casual_untracked_game(game)
+
+    white = game.get("white_player") or {}
+    black = game.get("black_player") or {}
+    if user["user_id"] == white.get("user_id"):
+        my_color = "white"
+    elif user["user_id"] == black.get("user_id"):
+        my_color = "black"
+    else:
+        raise HTTPException(status_code=403, detail="Not a player in this game")
+
+    moves = game.get("moves", [])
+    if not moves:
+        raise HTTPException(status_code=400, detail="No moves to take back")
+
+    # current_turn is whoever moves NEXT, i.e. the opponent of whoever
+    # just moved - so the last mover is the other color.
+    expected_current_turn = game["current_turn"]
+    last_mover = "black" if expected_current_turn == "white" else "white"
+    if last_mover != my_color:
+        raise HTTPException(status_code=403, detail="You can only take back your own last move, before your opponent replies")
+
+    fen_history = game.get("fen_history") or []
+    clock_history = game.get("clock_history") or []
+    if not fen_history:
+        # Game predates this feature's history-tracking (see
+        # create_tournament_game/create_game comments), or something else
+        # left the arrays out of sync with `moves` - either way there's
+        # nothing safe to restore to.
+        raise HTTPException(status_code=400, detail="Takeback isn't available for this move")
+
+    spend_result = await spend_credits(user["user_id"], "takeback_token", reference_id=game_id)
+
+    restored_fen = fen_history[-1]
+    restored_clock = clock_history[-1] if clock_history else {}
+    time_updates = {}
+    if restored_clock.get("white_time") is not None:
+        time_updates["white_time"] = restored_clock["white_time"]
+    if restored_clock.get("black_time") is not None:
+        time_updates["black_time"] = restored_clock["black_time"]
+
+    # Atomic conditional update: only apply if the game is still exactly
+    # where we read it (active, same current_turn) - guards against the
+    # opponent sneaking in a reply in the race window between our read
+    # and this write. If we lose that race, refund the token rather than
+    # leave the user charged for a takeback that never happened.
+    updated_game = await db.games.find_one_and_update(
+        {"game_id": game_id, "status": "active", "current_turn": expected_current_turn},
+        {
+            "$pop": {"moves": 1, "move_times": 1, "fen_history": 1, "clock_history": 1},
+            "$set": {
+                "fen": restored_fen,
+                "current_turn": last_mover,
+                **time_updates,
+            },
+        },
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 0},
+    )
+    if updated_game is None:
+        await grant_credits(
+            user["user_id"], spend_result["cost"], "refund",
+            reference_id=spend_result.get("tx_id"),
+            metadata={"reason": "takeback_race_lost", "game_id": game_id},
+        )
+        raise HTTPException(status_code=409, detail="Game state changed - please try again")
+
+    room_name = str(game_id)
+    payload = {
+        "game_id": game_id,
+        "fen": restored_fen,
+        "current_turn": last_mover,
+        "moves": updated_game.get("moves", []),
+        "white_time": updated_game.get("white_time"),
+        "black_time": updated_game.get("black_time"),
+        "by": user["user_id"],
+    }
+    await sio.emit('takeback_applied', payload, room=room_name)
+
+    return {
+        "success": True,
+        "game": GameResponse(**updated_game),
+        "credits_charged": spend_result["cost"],
+        "credits_balance": spend_result["credits_balance"],
+    }
+
+
+@api_router.post("/games/{game_id}/add-time")
+async def add_time_to_clock(game_id: str, request: Request):
+    """Phase 4e: spend credits to add EXTRA_TIME_SECONDS to your OWN
+    clock in a live casual, non-tournament game. Cannot add time to the
+    opponent's clock - this is a personal convenience purchase, not a way
+    to hobble the other player."""
+    user = await get_current_user(request)
+    game = await db.games.find_one({"game_id": game_id}, {"_id": 0})
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    if game.get("status") != "active":
+        raise HTTPException(status_code=400, detail="Game is not active")
+    _require_casual_untracked_game(game)
+
+    white = game.get("white_player") or {}
+    black = game.get("black_player") or {}
+    if user["user_id"] == white.get("user_id"):
+        my_color = "white"
+    elif user["user_id"] == black.get("user_id"):
+        my_color = "black"
+    else:
+        raise HTTPException(status_code=403, detail="Not a player in this game")
+
+    spend_result = await spend_credits(user["user_id"], "extra_time", reference_id=game_id)
+
+    time_field = f"{my_color}_time"
+    updated_game = await db.games.find_one_and_update(
+        {"game_id": game_id, "status": "active"},
+        {"$inc": {time_field: EXTRA_TIME_SECONDS}},
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 0},
+    )
+    if updated_game is None:
+        # Game ended in the race window between charging and applying -
+        # refund rather than leave the user charged for nothing.
+        await grant_credits(
+            user["user_id"], spend_result["cost"], "refund",
+            reference_id=spend_result.get("tx_id"),
+            metadata={"reason": "add_time_game_ended", "game_id": game_id},
+        )
+        raise HTTPException(status_code=400, detail="Game is no longer active")
+
+    room_name = str(game_id)
+    await sio.emit('clock_time_added', {
+        "game_id": game_id,
+        "color": my_color,
+        "seconds_added": EXTRA_TIME_SECONDS,
+        "white_time": updated_game.get("white_time"),
+        "black_time": updated_game.get("black_time"),
+        "by": user["user_id"],
+    }, room=room_name)
+
+    return {
+        "success": True,
+        "color": my_color,
+        "seconds_added": EXTRA_TIME_SECONDS,
+        "white_time": updated_game.get("white_time"),
+        "black_time": updated_game.get("black_time"),
+        "credits_charged": spend_result["cost"],
+        "credits_balance": spend_result["credits_balance"],
+    }
+
+
+# ---- Custom Chess Clock presets ----
+# The standalone Chess Clock tool (/chess-clock) is entirely client-side
+# today - no backend game object, just a set of built-in defaults
+# (1+0, 3+0, 5+0, 10+0, 15+10, matching Lobby.jsx's TIME_CONTROLS). This
+# adds the ability to save custom named time controls beyond those
+# defaults. First CUSTOM_CLOCK_PRESET_FREE_LIMIT saved presets per user
+# are free; each one beyond that costs "custom_clock_preset" credits.
+# Modeled as a persistent buy-once-keep-forever count (like Phase 4b's
+# puzzle_pack), not a daily/monthly budget, since a saved preset doesn't
+# expire.
+#
+# Concurrency note: the free-count check below is read-then-write, not
+# claimed atomically like _claim_unlock's keyed unlocks - two truly
+# simultaneous "save preset" requests from the same user could in theory
+# both see count < free_limit and both save for free. Unlike credits or
+# wallet balance, the worst case here is one extra free row in a list the
+# user manages themselves, not a monetary loss - not worth the extra
+# complexity of a transactional claim for that.
+
+@api_router.get("/clock-presets")
+async def list_clock_presets(request: Request):
+    user = await get_current_user(request)
+    presets = await db.custom_clock_presets.find(
+        {"user_id": user["user_id"]}, {"_id": 0}
+    ).sort("created_at", 1).to_list(200)
+    cost = await get_credit_feature_cost("custom_clock_preset")
+    return {
+        "presets": presets,
+        "free_limit": CUSTOM_CLOCK_PRESET_FREE_LIMIT,
+        "used": len(presets),
+        "remaining_free": max(0, CUSTOM_CLOCK_PRESET_FREE_LIMIT - len(presets)),
+        "extra_preset_cost": cost,
+    }
+
+
+@api_router.post("/clock-presets")
+async def create_clock_preset(preset_data: ClockPresetCreate, request: Request):
+    user = await get_current_user(request)
+    if preset_data.white_minutes <= 0 or preset_data.black_minutes <= 0:
+        raise HTTPException(status_code=400, detail="Minutes must be greater than 0")
+    if not preset_data.name.strip():
+        raise HTTPException(status_code=400, detail="Preset name is required")
+
+    existing_count = await db.custom_clock_presets.count_documents({"user_id": user["user_id"]})
+    paid = existing_count >= CUSTOM_CLOCK_PRESET_FREE_LIMIT
+
+    preset_id = f"clockpreset_{uuid.uuid4().hex[:12]}"
+    spend_result = None
+    if paid:
+        spend_result = await spend_credits(user["user_id"], "custom_clock_preset", reference_id=preset_id)
+
+    preset_doc = {
+        "preset_id": preset_id,
+        "user_id": user["user_id"],
+        "name": preset_data.name.strip()[:60],
+        "white_minutes": preset_data.white_minutes,
+        "black_minutes": preset_data.black_minutes,
+        "increment_seconds": max(0, preset_data.increment_seconds),
+        "tx_id": spend_result["tx_id"] if spend_result else None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        await db.custom_clock_presets.insert_one(dict(preset_doc))
+    except Exception:
+        if spend_result:
+            await grant_credits(
+                user["user_id"], spend_result["cost"], "refund",
+                reference_id=spend_result.get("tx_id"),
+                metadata={"reason": "clock_preset_create_failed"},
+            )
+        raise
+
+    preset_doc.pop("_id", None)
+    return {
+        "success": True,
+        "preset": ClockPresetResponse(**preset_doc),
+        "paid": paid,
+        "credits_charged": spend_result["cost"] if spend_result else 0,
+        "credits_balance": spend_result["credits_balance"] if spend_result else None,
+    }
+
+
+@api_router.delete("/clock-presets/{preset_id}")
+async def delete_clock_preset(preset_id: str, request: Request):
+    """Deletes a saved preset. Does not refund any credits that were
+    spent to save it beyond the free cap - same non-refundable-once-
+    granted precedent as every other Phase 4 unlock/spend."""
+    user = await get_current_user(request)
+    result = await db.custom_clock_presets.delete_one({"preset_id": preset_id, "user_id": user["user_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Preset not found")
+    return {"success": True}
+
 
 # ============= WITHDRAWAL MANAGEMENT =============
 
@@ -5382,6 +7167,173 @@ async def shutdown_db_client():
 
 @app.on_event("startup")
 async def startup_tasks():
+    # Credits system (Phase 1) indexes
+    await db.credit_transactions.create_index("tx_id", unique=True)
+    await db.credit_transactions.create_index([("user_id", 1), ("created_at", -1)])
+    await db.credit_feature_costs.create_index("feature_key", unique=True)
+
+    # Phase 4a: per-user unlock/cache collections. Each unique index is
+    # what _claim_unlock() relies on to make the "claim before charge"
+    # pattern race-safe - a duplicate insert means a concurrent request
+    # already won the claim.
+    await db.game_review_unlocks.create_index([("user_id", 1), ("game_id", 1)], unique=True)
+    await db.deep_analysis_unlocks.create_index([("user_id", 1), ("game_id", 1)], unique=True)
+    await db.pgn_analysis_cache.create_index([("user_id", 1), ("pgn_hash", 1)], unique=True)
+
+    # Phase 4b: puzzle pack unlocks (persistent, like the unlocks above -
+    # you buy a difficulty tier once and keep it). Daily retry/skip
+    # budgets live on puzzle_progress instead, no separate index needed.
+    await db.puzzle_pack_unlocks.create_index([("user_id", 1), ("difficulty", 1)], unique=True)
+
+    # Phase 4c: daily budget tracker for extra challenge invites (shares
+    # the generalized _consume_daily_budget/_record_daily_usage helpers
+    # with Phase 4b's puzzle_progress-backed budgets, via a separate
+    # collection so the two budgets never collide).
+    await db.social_daily_usage.create_index("user_id", unique=True)
+
+    # Phase 4d: monthly usage tracker for PGN imports (same
+    # _consume_monthly_budget/_record_monthly_usage shape as the daily
+    # budgets above, just month-grained and in its own collection so it
+    # never collides with the puzzle/social daily budgets).
+    await db.pgn_import_usage.create_index("user_id", unique=True)
+
+    # Phase 4e: custom clock presets (persistent, like puzzle_pack_unlocks -
+    # not unique on user_id since a user can own many presets).
+    await db.custom_clock_presets.create_index("user_id")
+    await db.custom_clock_presets.create_index("preset_id", unique=True)
+
+    # Phase 3: seed a dummy feature cost so spend_credits() / POST
+    # /credits/spend can be exercised end-to-end before Phase 4 gates any
+    # real feature. Safe to delete once real features are priced.
+    await db.credit_feature_costs.update_one(
+        {"feature_key": "test_dummy_feature"},
+        {
+            "$setOnInsert": {
+                "feature_key": "test_dummy_feature",
+                "cost": 10,
+                "category": "test",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+        upsert=True,
+    )
+
+    # Phase 4a: initial prices for game review/deep analysis/PGN deep
+    # analysis/opening explorer depth. Same $setOnInsert + upsert pattern
+    # as 4b/4c/4d/4e - without this, spend_credits() 500s on all four
+    # feature keys (no configured cost) and Phase 4a is dead on arrival.
+    # Never overwrites a price an admin has since changed via
+    # PUT /admin/credit-feature-costs/{feature_key}.
+    phase_4a_costs = {
+        "game_review": 20,
+        "deep_analysis": 30,
+        "pgn_deep_analysis": 30,
+        "opening_explorer_deep": 5,
+    }
+    for feature_key, cost in phase_4a_costs.items():
+        await db.credit_feature_costs.update_one(
+            {"feature_key": feature_key},
+            {
+                "$setOnInsert": {
+                    "feature_key": feature_key,
+                    "cost": cost,
+                    "category": "analysis",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
+        )
+
+    # Phase 4b: initial prices for puzzle retries/skips/packs. $setOnInsert
+    # + upsert so this only sets a price the first time a feature_key is
+    # seen - it will never overwrite a price an admin has since changed via
+    # PUT /admin/credit-feature-costs/{feature_key}.
+    phase_4b_costs = {
+        "puzzle_retry": 5,
+        "puzzle_skip": 5,
+        "puzzle_pack": 50,
+    }
+    for feature_key, cost in phase_4b_costs.items():
+        await db.credit_feature_costs.update_one(
+            {"feature_key": feature_key},
+            {
+                "$setOnInsert": {
+                    "feature_key": feature_key,
+                    "cost": cost,
+                    "category": "puzzles",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
+        )
+
+    # Phase 4c: initial prices for boost/rematch/challenge-invite/private-
+    # tournament. Same $setOnInsert + upsert pattern as Phase 4b - without
+    # this, spend_credits() 500s on all four feature keys (no configured
+    # cost) and Phase 4c is dead on arrival. Never overwrites a price an
+    # admin has since changed via PUT /admin/credit-feature-costs/{feature_key}.
+    phase_4c_costs = {
+        "featured_game": 25,
+        "rematch_token": 10,
+        "challenge_invite_extra": 5,
+        "private_tournament_create": 100,
+    }
+    for feature_key, cost in phase_4c_costs.items():
+        await db.credit_feature_costs.update_one(
+            {"feature_key": feature_key},
+            {
+                "$setOnInsert": {
+                    "feature_key": feature_key,
+                    "cost": cost,
+                    "category": "social",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
+        )
+
+    # Phase 4d: initial price for imports beyond the free monthly cap.
+    # Same $setOnInsert + upsert pattern as 4b/4c - without this,
+    # spend_credits() 500s on pgn_import_extra once PGN_FREE_MONTHLY_IMPORTS
+    # is used up, and never overwrites a price an admin has since changed
+    # via PUT /admin/credit-feature-costs/{feature_key}.
+    await db.credit_feature_costs.update_one(
+        {"feature_key": "pgn_import_extra"},
+        {
+            "$setOnInsert": {
+                "feature_key": "pgn_import_extra",
+                "cost": 15,
+                "category": "study",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+        upsert=True,
+    )
+
+    # Phase 4e: initial prices for takeback/extra-time/clock-presets. Same
+    # $setOnInsert + upsert pattern as 4b/4c/4d - without this,
+    # spend_credits() 500s on all three feature keys, and never overwrites
+    # a price an admin has since changed via
+    # PUT /admin/credit-feature-costs/{feature_key}.
+    phase_4e_costs = {
+        "takeback_token": 15,
+        "extra_time": 10,
+        "custom_clock_preset": 20,
+    }
+    for feature_key, cost in phase_4e_costs.items():
+        await db.credit_feature_costs.update_one(
+            {"feature_key": feature_key},
+            {
+                "$setOnInsert": {
+                    "feature_key": feature_key,
+                    "cost": cost,
+                    "category": "utility",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
+        )
+
     # Create admin user
     admin = await db.users.find_one({"email": "admin@stakechess.com"})
     if not admin:
@@ -5396,12 +7348,15 @@ async def startup_tasks():
             "losses": 0,
             "draws": 0,
             "wallet_balance": {"USDT": 10000.0, "BTC": 1.0, "ETH": 10.0},
+            "credits_balance": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "is_admin": True,
             "is_flagged": False,
             "is_banned": False
         }
         await db.users.insert_one(admin_doc)
+        # Signup bonus: 400 free credits, granted once here at account creation.
+        await grant_credits(admin_doc["user_id"], SIGNUP_BONUS_CREDITS, "signup_bonus")
         logger.info("Admin user created: admin@stakechess.com / admin123")
     
     # Create sample tournaments

@@ -34,8 +34,17 @@ export default function Register() {
     setLoading(true);
 
     try {
-      await register(username, email, password);
-      toast.success("Account created! You've received $100 USDT demo balance.");
+      const userData = await register(username, email, password);
+      // Phase 5: surface the signup credits bonus explicitly, not just the
+      // wallet demo balance - use the actual credits_balance the server
+      // granted rather than hardcoding 400, so this stays correct even if
+      // SIGNUP_BONUS_CREDITS ever changes.
+      const creditsGranted = userData?.credits_balance;
+      toast.success(
+        creditsGranted
+          ? `Account created! You've received $100 USDT demo balance and ${creditsGranted.toLocaleString()} free credits.`
+          : "Account created! You've received $100 USDT demo balance."
+      );
       navigate("/lobby");
     } catch (error) {
       const detail = error.response?.data?.detail;
@@ -234,10 +243,14 @@ export default function Register() {
           </p>
         </div>
 
-        {/* Bonus notice */}
+        {/* Bonus notice. "400 free credits" mirrors the backend's
+            SIGNUP_BONUS_CREDITS - display-only, since there's no user
+            object yet to read the real value from before they've signed
+            up. The post-signup toast above uses the actual granted amount. */}
         <div className="mt-6 p-4 bg-success-dim border border-success rounded-xl">
           <p className="text-success text-sm text-center">
-            🎁 New accounts receive <span className="font-bold">$100 USDT</span> demo balance!
+            🎁 New accounts receive <span className="font-bold">$100 USDT</span> demo balance and{" "}
+            <span className="font-bold">400 free credits</span>!
           </p>
         </div>
       </div>

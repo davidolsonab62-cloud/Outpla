@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
@@ -11,7 +11,8 @@ import { SkeletonPanel } from "@/components/ui/skeletons";
 import BackButton from "@/components/layout/BackButton";
 
 export default function Leaderboard() {
-  const { user, token } = useAuth();
+  const { user, token, refreshUser } = useAuth();
+  const navigate = useNavigate();
   const [players, setPlayers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [sortBy, setSortBy] = useState("rating");
@@ -19,6 +20,10 @@ export default function Leaderboard() {
   const [convPartner, setConvPartner] = useState(null);
   const [convMessages, setConvMessages] = useState([]);
   const [convInput, setConvInput] = useState("");
+  // Phase 5: ambient free-daily-challenge-invite status, so the price
+  // (once free ones run out) is visible before it's spent, not just
+  // after a 402 from the per-row challenge button below.
+  const [inviteStatus, setInviteStatus] = useState(null);
 
   // Listen for incoming direct messages globally
   useEffect(() => {
@@ -51,6 +56,14 @@ export default function Leaderboard() {
   useEffect(() => {
     fetchLeaderboard();
   }, [sortBy]);
+
+  useEffect(() => {
+    if (!token) return;
+    axios
+      .get(`${API}/challenges/invite-status`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => setInviteStatus(response.data))
+      .catch(() => {});
+  }, [token]);
 
   const fetchLeaderboard = async () => {
     setLoading(true);
@@ -96,6 +109,13 @@ export default function Leaderboard() {
             <span style={{ color: "var(--brand)" }}>Leaderboard</span>
           </h1>
           <p className="sc-reveal-item" style={{ color: "var(--text-secondary)" }}>The best players on StakeChess</p>
+          {inviteStatus && (
+            <p className="sc-reveal-item text-xs mt-2" style={{ color: "var(--text-secondary)" }}>
+              {inviteStatus.remaining_free > 0
+                ? `${inviteStatus.remaining_free} free challenge invites left today`
+                : `Out of free challenge invites today — the next one costs ${inviteStatus.cost ?? "?"} credits`}
+            </p>
+          )}
         </div>
 
         <Tabs
@@ -235,10 +255,28 @@ export default function Leaderboard() {
                                 }, { headers: { Authorization: `Bearer ${token}` } });
 
                                 const gameId = res.data.game_id;
-                                await axios.post(`${API}/challenges`, { target_user_id: player.user_id, game_id: gameId }, { headers: { Authorization: `Bearer ${token}` } });
-                                toast.success('Challenge sent');
+                                const challengeRes = await axios.post(`${API}/challenges`, { target_user_id: player.user_id, game_id: gameId }, { headers: { Authorization: `Bearer ${token}` } });
+                                // Phase 4c: past the free daily challenge limit, sending
+                                // this one spent credits - let the sender know why.
+                                if (challengeRes.data?.credits_charged) {
+                                  toast.success('Challenge sent (used a paid invite - out of free ones for today)');
+                                  refreshUser();
+                                } else {
+                                  toast.success('Challenge sent');
+                                }
+                                axios
+                                  .get(`${API}/challenges/invite-status`, { headers: { Authorization: `Bearer ${token}` } })
+                                  .then((response) => setInviteStatus(response.data))
+                                  .catch(() => {});
                               } catch (e) {
                                 console.error('Failed to send challenge', e);
+                                const detail = e?.response?.data?.detail;
+                                if (e?.response?.status === 402 && detail?.error === 'insufficient_credits') {
+                                  toast.error(`Not enough credits — an extra challenge invite costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+                                    action: { label: 'Buy credits', onClick: () => navigate('/wallet') },
+                                  });
+                                  return;
+                                }
                                 toast.error('Failed to send challenge');
                               }
                             }}
