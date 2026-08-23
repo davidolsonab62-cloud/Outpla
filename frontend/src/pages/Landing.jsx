@@ -77,18 +77,15 @@ function HeroBoard() {
   // /hero-chess-light.webp for light mode (transparent background,
   // tightly cropped to the actual pieces/board with almost no margin).
   // The light asset can't reuse the dark asset's full oversized/shifted
-  // sizing - blowing a tightly-cropped image up to 118% and shifting it
-  // -8% right pushes the king and board edge past the panel's
-  // overflow-hidden bounds, cropping it on both desktop and mobile. It
-  // can take a smaller bump though (112% / -3% shift) before that
-  // happens, since the panel still has a little breathing room on the
-  // right at md+ (pr-0 there vs pr-6 on mobile) - re-check both
-  // breakpoints if this ratio changes again.
+  // sizing - blowing a tightly-cropped image up too far or shifting it
+  // too far right pushes the king and board edge past the panel's
+  // overflow-hidden bounds, cropping it on both desktop and mobile.
+  // Re-check both breakpoints if either ratio changes again.
   const isLight = theme === "light";
   const heroSrc = isLight ? "/hero-chess-light.webp" : "/hero-chess.webp";
 
   return (
-    <div className="relative w-full">
+    <div className={isLight ? "relative w-full md:-ml-10 lg:-ml-16" : "relative w-full"}>
       {/* glow bleeding out past the image edges, so it melts into the panel */}
       <div
         className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[125%] h-[125%]"
@@ -103,7 +100,7 @@ function HeroBoard() {
         alt="Chess king spotlit on a board, surrounded by other pieces"
         className={
           isLight
-            ? "relative h-auto select-none w-[112%] max-w-none -mr-[3%]"
+            ? "relative h-auto select-none w-[120%] max-w-none -mr-[6%]"
             : "relative h-auto select-none w-[118%] max-w-none -mr-[8%] md:-mt-6"
         }
         draggable="false"
@@ -355,7 +352,7 @@ export default function Landing() {
             style={{ background: "radial-gradient(circle, rgba(60,203,127,.14), transparent 70%)" }}
           />
 
-          <div className="relative grid md:grid-cols-[1.02fr,1fr] gap-8 items-center pl-6 md:pl-12 pt-10 md:pt-14 pr-6 md:pr-0">
+          <div className={`relative grid md:grid-cols-[1.02fr,1fr] items-center pl-6 md:pl-12 pt-10 md:pt-14 pr-6 md:pr-0 ${isDark ? "gap-8" : "gap-6 md:gap-2"}`}>
             <div className="pb-2">
               <div className="sc-reveal-item mb-6 flex items-center gap-3 flex-wrap">
                 <img
