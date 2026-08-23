@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef } from "react";
-import { useLocation, useOutlet } from "react-router-dom";
+import { useLocation, useOutlet, Link } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
+import { Wallet, Coins } from "lucide-react";
 import Sidebar from "@/components/layout/Sidebar";
 import { useTheme } from "@/context/ThemeContext";
+import { useAuth } from "@/App";
 
 const STORAGE_KEY = "stakechess-sidebar-collapsed";
 
@@ -68,6 +70,7 @@ export default function AppShell() {
   });
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const location = useLocation();
+  const { user } = useAuth();
   const { theme, toggleTheme } = useTheme();
   const isDark = theme === "dark";
 
@@ -187,6 +190,26 @@ export default function AppShell() {
           </button>
 
           <div className="flex-1" />
+
+          {user && (
+            <Link
+              to="/wallet"
+              className="flex items-center gap-2 sm:gap-3 rounded-lg px-2 sm:px-2.5 py-1.5 no-underline mr-1 sc-nav-row"
+              style={{ background: "var(--surface-1)", border: "1px solid var(--hairline)" }}
+              title={`${(user.wallet_balance?.USDT ?? 0).toFixed(2)} USDT · ${(user.credits_balance ?? 0).toLocaleString()} credits`}
+            >
+              <span className="flex items-center gap-1.5 text-[12px]" style={{ color: "var(--text-secondary)" }}>
+                <Wallet className="w-3.5 h-3.5 shrink-0" />
+                {(user.wallet_balance?.USDT ?? 0).toFixed(2)}
+                <span className="hidden sm:inline">&nbsp;USDT</span>
+              </span>
+              <span className="flex items-center gap-1.5 text-[12px] font-semibold" style={{ color: "var(--brand)" }}>
+                <Coins className="w-3.5 h-3.5 shrink-0" />
+                {(user.credits_balance ?? 0).toLocaleString()}
+                <span className="hidden sm:inline">&nbsp;cr</span>
+              </span>
+            </Link>
+          )}
 
           <button
             onClick={toggleTheme}

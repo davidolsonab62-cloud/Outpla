@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Chessboard, defaultPieces } from "react-chessboard";
 import { Chess } from "chess.js";
 import { Button } from "@/components/ui/button";
@@ -74,7 +75,8 @@ function countPiecesFromFen(fen) {
 }
 
 export default function BoardEditor() {
-  const { user } = useAuth();
+  const { user, token } = useAuth();
+  const navigate = useNavigate();
   const { boardSquareColors, theme: boardThemeName, color: boardColorName } = resolveBoardPrefs(user);
   const chessRef = useRef(buildChess());
   const boardWrapperRef = useRef(null);
@@ -103,6 +105,11 @@ export default function BoardEditor() {
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
   const [analysisHistory, setAnalysisHistory] = useState([]);
+  // Free-then-paid allowance info from the last /board/analyze response -
+  // this is Board Editor's own 5-free-then-30-credit allowance, separate
+  // from the match Game Review's allowance.
+  const [freeUsesRemaining, setFreeUsesRemaining] = useState(null);
+  const [analysisCost, setAnalysisCost] = useState(null);
   const [activeHistoryId, setActiveHistoryId] = useState(null);
   const [boardOrientation, setBoardOrientation] = useState("white");
 
@@ -386,6 +393,10 @@ export default function BoardEditor() {
     if (!fen) {
       return;
     }
+    if (!token) {
+      toast.error("Log in to analyze positions with Stockfish.");
+      return;
+    }
 
     analysisAbortRef.current?.abort();
     const controller = new AbortController();
@@ -395,17 +406,23 @@ export default function BoardEditor() {
     setAnalysisError(null);
 
     try {
+      // Deep Stockfish analysis of this custom position - Board Editor's
+      // own 5-free-then-30-credit allowance (feature key "board_analysis").
+      // Always deep depth; there's no separate quick/shallow tier.
       const response = await axios.post(
-        `${API}/computer/move`,
+        `${API}/board/analyze`,
         {
           fen,
-          depth: 12,
-          analysis: true,
           multi_pv: 3,
         },
-        { signal: controller.signal }
+        { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal }
       );
       setAnalysis(response.data);
+      setFreeUsesRemaining(response.data.free_uses_remaining ?? null);
+      setAnalysisCost(response.data.cost ?? null);
+      if (response.data.paid) {
+        toast.success(`Deep analysis complete — ${response.data.cost} credits spent.`);
+      }
       const entryId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       setAnalysisHistory((prev) => [
         { id: entryId, fen, analysis: response.data, analyzedAt: Date.now() },
@@ -416,8 +433,16 @@ export default function BoardEditor() {
       if (axios.isCancel(error) || error.code === "ERR_CANCELED" || error.name === "CanceledError") {
         return;
       }
-      const message = error?.response?.data?.detail || error?.message || "Failed to analyze position.";
-      setAnalysisError(message);
+      const detail = error?.response?.data?.detail;
+      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
+        toast.error(`Not enough credits — deep analysis costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
+        });
+        setAnalysisError("insufficient_credits");
+      } else {
+        const message = detail?.detail || detail || error?.message || "Failed to analyze position.";
+        setAnalysisError(message);
+      }
       setAnalysis(null);
     } finally {
       if (analysisAbortRef.current === controller) {
@@ -425,7 +450,7 @@ export default function BoardEditor() {
         setAnalysisLoading(false);
       }
     }
-  }, []);
+  }, [token, navigate]);
 
   const handleStopAnalysis = useCallback(() => {
     analysisAbortRef.current?.abort();
@@ -617,16 +642,30 @@ export default function BoardEditor() {
                 </Button>
               )}
             </div>
-            <p className="text-sm text-text-secondary mb-4">
-              Use the board editor to set up any position, then request the best moves and evaluation.
+            <p className="text-sm text-text-secondary mb-1">
+              Set up any position, then run a deep Stockfish analysis for the best moves and evaluation.
+            </p>
+            <p className="text-xs text-text-secondary mb-4">
+              {freeUsesRemaining != null
+                ? freeUsesRemaining > 0
+                  ? `${freeUsesRemaining} free analysis${freeUsesRemaining === 1 ? "" : "es"} left, then ${analysisCost ?? 30} credits each.`
+                  : `Your 5 free analyses are used up — each analysis now costs ${analysisCost ?? 30} credits.`
+                : "First 5 analyses are free, then 30 credits each."}
             </p>
 
             <div className="grid gap-3">
-              {analysisError && (
+              {analysisError === "insufficient_credits" ? (
+                <div className="rounded-2xl bg-danger-dim border border-danger p-3 text-sm text-danger flex items-center justify-between gap-3">
+                  <span>Out of free analyses and credits.</span>
+                  <Button size="sm" variant="outline" onClick={() => navigate("/wallet")} className="font-semibold shrink-0">
+                    Buy credits
+                  </Button>
+                </div>
+              ) : analysisError ? (
                 <div className="rounded-2xl bg-danger-dim border border-danger p-3 text-sm text-danger">
                   {analysisError}
                 </div>
-              )}
+              ) : null}
 
               {analysis ? (
                 <div className="rounded-2xl bg-white border border-hair p-4 text-sm text-text-primary">

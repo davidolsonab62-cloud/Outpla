@@ -3063,7 +3063,9 @@ async def boost_game(game_id: str, request: Request):
 
 @api_router.post("/games/{game_id}/analysis")
 async def analyze_game(game_id: str, request: Request):
-    """Run Stockfish analysis (depth 15) for a completed game and persist results."""
+    """Run Stockfish Game Review (deep analysis, see ANALYSIS_DEPTH) for a
+    completed game and persist results. Gated by the game_review 5-free-
+    then-30-credit allowance."""
     user = await get_current_user(request)
     game = await db.games.find_one({"game_id": game_id}, {"_id": 0})
     if not game:
@@ -3095,14 +3097,17 @@ async def analyze_game(game_id: str, request: Request):
         await db.games.update_one({"game_id": game_id}, {"$set": {"analysis": analysis_doc}})
         return {"success": False, "analysis": analysis_doc, "engine_available": False}
 
-    # Phase 4a: per-user paid unlock (feature key "game_review"). The
+    # Game Review's own 5-free-then-30-credit allowance (feature key
+    # "game_review"), separate from the Board Editor's "board_analysis"
+    # allowance - see _claim_unlock_with_free_tier's docstring. The
     # underlying Stockfish result is cached/shared on the game doc below,
-    # but each viewing user is billed once via _claim_unlock - see that
-    # function's docstring for why the claim happens before the charge.
-    # Raises HTTPException(402) if the user has insufficient credits.
-    await _claim_unlock(
+    # but each reviewing user's free/paid slot is claimed once via this
+    # helper, same "claim before charge" race-safety as the old
+    # _claim_unlock. Raises HTTPException(402) if the user is past their
+    # free reviews and doesn't have enough credits.
+    claim = await _claim_unlock_with_free_tier(
         db.game_review_unlocks, user["user_id"], {"game_id": game_id},
-        "game_review", reference_id=game_id,
+        "game_review", GAME_REVIEW_FREE_LIMIT, "game_review", reference_id=game_id,
     )
 
     starting_fen = game.get("initial_fen") if game.get("initial_fen") else None
@@ -3117,10 +3122,22 @@ async def analyze_game(game_id: str, request: Request):
         if fresh_game and fresh_game.get("analysis"):
             return {"success": True, "analysis": fresh_game["analysis"]}
 
-        analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, 12)
+        # Game Review now always runs at deep depth (formerly the separate,
+        # extra-cost "Deep Analysis" feature) - see ANALYSIS_DEPTH's docstring.
+        analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, ANALYSIS_DEPTH)
 
     if not analysis.get("engine_available"):
         logger.warning(f"Stockfish analysis failed for game {game_id}: {analysis.get('error')}")
+        # The unlock was claimed (and, if past the free tier, credits were
+        # charged) before we knew Stockfish would actually produce a
+        # result. Since it didn't, undo the claim and refund any spend so
+        # the user isn't left paying for a review they never got, and can
+        # simply retry (this is the bug the old /deep-analysis endpoint
+        # had: it charged credits up front and never refunded on failure).
+        await _refund_unlock_claim(
+            db.game_review_unlocks, user["user_id"], {"game_id": game_id},
+            claim, "game_review", reason=analysis.get("error", "stockfish_failed"),
+        )
         analysis_doc = {
             "analysis_id": f"an_{uuid.uuid4().hex[:12]}",
             "game_id": game_id,
@@ -3131,13 +3148,16 @@ async def analyze_game(game_id: str, request: Request):
             "error": analysis.get("error", "Stockfish analysis failed"),
             "created_at": datetime.now(timezone.utc).isoformat()
         }
-        await db.games.update_one({"game_id": game_id}, {"$set": {"analysis": analysis_doc}})
+        # Deliberately NOT persisted to the game doc (unlike the old
+        # behavior) - caching a failure here would make every future
+        # request see engine_available: False forever instead of retrying,
+        # even though the claim/charge has just been rolled back.
         return {"success": False, "analysis": analysis_doc, "engine_available": False}
 
     analysis_doc = {
         "analysis_id": f"an_{uuid.uuid4().hex[:12]}",
         "game_id": game_id,
-        "depth": analysis.get("depth", 12),
+        "depth": analysis.get("depth", ANALYSIS_DEPTH),
         "summary": analysis.get("summary"),
         "moves": analysis.get("moves"),
         "engine_available": True,
@@ -3147,7 +3167,7 @@ async def analyze_game(game_id: str, request: Request):
     # Persist analysis on the game document for quick retrieval
     await db.games.update_one({"game_id": game_id}, {"$set": {"analysis": analysis_doc}})
 
-    return {"success": True, "analysis": analysis_doc}
+    return {"success": True, "analysis": analysis_doc, "paid": claim["paid"], "already_unlocked": claim["already_unlocked"]}
 
 
 @api_router.get("/games/{game_id}/analysis")
@@ -3189,13 +3209,14 @@ async def get_game_analysis(game_id: str, request: Request):
             }
         }
 
-    # Phase 4a: per-user paid unlock (feature key "game_review"). Applies
-    # whether analysis is already cached or still needs computing - see
-    # _claim_unlock's docstring. Raises HTTPException(402) if the user
+    # Game Review's 5-free-then-30-credit allowance (feature key
+    # "game_review"). Applies whether analysis is already cached or still
+    # needs computing - see _claim_unlock_with_free_tier's docstring.
+    # Raises HTTPException(402) if the user is past their free reviews and
     # doesn't have enough credits.
-    await _claim_unlock(
+    claim = await _claim_unlock_with_free_tier(
         db.game_review_unlocks, user["user_id"], {"game_id": game_id},
-        "game_review", reference_id=game_id,
+        "game_review", GAME_REVIEW_FREE_LIMIT, "game_review", reference_id=game_id,
     )
 
     if analysis:
@@ -3230,11 +3251,21 @@ async def get_game_analysis(game_id: str, request: Request):
             # the event loop (this was previously called directly, which stalled the
             # ENTIRE server — including unrelated requests like fetching game state
             # for the replay controls — for as long as the analysis took).
-            analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, 12)
+            # Game Review now always runs at deep depth (formerly the separate,
+            # extra-cost "Deep Analysis" feature) - see ANALYSIS_DEPTH's docstring.
+            analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, ANALYSIS_DEPTH)
 
         if not analysis.get("engine_available"):
             logger.warning(f"Stockfish analysis failed for game {game_id}: {analysis.get('error')}")
-            # Return graceful failure instead of 503
+            # Undo the claim and refund any spend - see the POST handler's
+            # comment above for why this matters (this is the exact bug
+            # the old /deep-analysis endpoint had).
+            await _refund_unlock_claim(
+                db.game_review_unlocks, user["user_id"], {"game_id": game_id},
+                claim, "game_review", reason=analysis.get("error", "stockfish_failed"),
+            )
+            # Return graceful failure instead of 503. Deliberately NOT
+            # persisted to the game doc so a retry actually retries.
             return {
                 "analysis": {
                     "analysis_id": f"an_{uuid.uuid4().hex[:12]}",
@@ -3251,7 +3282,7 @@ async def get_game_analysis(game_id: str, request: Request):
         analysis_doc = {
             "analysis_id": f"an_{uuid.uuid4().hex[:12]}",
             "game_id": game_id,
-            "depth": analysis.get("depth", 12),
+            "depth": analysis.get("depth", ANALYSIS_DEPTH),
             "summary": analysis.get("summary"),
             "moves": analysis.get("moves"),
             "engine_available": True,
@@ -3259,9 +3290,16 @@ async def get_game_analysis(game_id: str, request: Request):
         }
 
         await db.games.update_one({"game_id": game_id}, {"$set": {"analysis": analysis_doc}})
-        return {"analysis": analysis_doc}
+        return {"analysis": analysis_doc, "paid": claim["paid"], "already_unlocked": claim["already_unlocked"]}
     except Exception as e:
         logger.exception(f"Exception during analysis for game {game_id}: {e}")
+        # Same as above: an exception here means the claim was made (and
+        # possibly charged) but no review was ever produced, so refund it
+        # rather than leaving the user out of pocket for nothing.
+        await _refund_unlock_claim(
+            db.game_review_unlocks, user["user_id"], {"game_id": game_id},
+            claim, "game_review", reason=str(e),
+        )
         # Return graceful error response
         return {
             "analysis": {
@@ -4827,11 +4865,23 @@ async def admin_set_credit_feature_cost(feature_key: str, update: CreditFeatureC
 # Feature keys introduced in this phase (price each via
 # PUT /admin/credit-feature-costs/{feature_key} - nothing here is
 # hardcoded, per the locked "all credit costs are configurable" decision):
-#   - "game_review"          per-user unlock of the standard depth-12
-#                             Stockfish review for one completed game
-#   - "deep_analysis"        per-user unlock of a deeper (depth 20)
-#                             re-analysis of one of the user's own
-#                             completed games
+#   - "game_review"          per-user, per-game unlock of the post-game
+#                             blunder/accuracy report. Always runs at deep
+#                             depth (ANALYSIS_DEPTH). Gated by its own
+#                             lifetime allowance: the first
+#                             GAME_REVIEW_FREE_LIMIT games a user reviews
+#                             are free, every one after that costs
+#                             "game_review" credits.
+#   - "board_analysis"       per-use charge for the Board Editor's
+#                             "Analyze" button (arbitrary custom
+#                             positions, not tied to a saved game). Always
+#                             runs at deep depth. Gated by its own,
+#                             separate lifetime allowance: the first
+#                             BOARD_ANALYSIS_FREE_LIMIT analyses are free,
+#                             every one after that costs "board_analysis"
+#                             credits. Deliberately a *different* budget
+#                             from game_review's so the two never share a
+#                             counter, per spec.
 #   - "pgn_deep_analysis"    deep analysis of an arbitrary imported PGN,
 #                             charged once per distinct PGN per user
 #   - "opening_explorer_deep" per-query cost for opening-explorer lookups
@@ -4840,12 +4890,26 @@ async def admin_set_credit_feature_cost(feature_key: str, update: CreditFeatureC
 # None of these have a cost until an admin sets one via the endpoint
 # above - spend_credits() 500s on an unpriced feature_key by design, so a
 # feature can't accidentally go live unpriced.
+#
+# NOTE: there used to be a separate "deep_analysis" feature/endpoint
+# offering a deeper re-analysis on top of the standard game_review. It has
+# been retired: game_review now runs at that same deep depth directly
+# (there's no more "shallow" review to upsell from), which also removes
+# the bug where /games/{game_id}/deep-analysis charged credits up front
+# and had no refund path when the underlying Stockfish run failed - see
+# _refund_unlock_claim / _refund_lifetime_spend below.
 
-DEEP_ANALYSIS_DEPTH = 20
+ANALYSIS_DEPTH = 20  # deep depth used by both Game Review and Board Editor analysis
 PGN_ANALYSIS_DEPTH = 18
 # First 3 full moves (6 ply) of the in-house opening explorer are free;
 # looking deeper than that costs credits. "Basic depth" per the spec.
 OPENING_EXPLORER_FREE_PLY = 6
+
+# Lifetime (not daily/monthly) free-use allowances before credits are
+# charged. Separate constants/budgets per spec - Board Editor analysis and
+# Game Review never share a counter, even though they're priced the same.
+GAME_REVIEW_FREE_LIMIT = 5
+BOARD_ANALYSIS_FREE_LIMIT = 5
 
 
 async def _claim_unlock(
@@ -4904,6 +4968,153 @@ async def _claim_unlock(
     return {"already_unlocked": False, "unlock": claim_doc, "spend": spend_result}
 
 
+async def _claim_unlock_with_free_tier(
+    collection,
+    user_id: str,
+    doc_key: dict,
+    budget_key: str,
+    free_limit: int,
+    feature_key: str,
+    reference_id: Optional[str] = None,
+) -> dict:
+    """Like _claim_unlock, but the charge itself is gated by a lifetime
+    free-then-paid allowance instead of always costing `feature_key`
+    credits: a user's first `free_limit` claims against this `collection`
+    are free, and only claims after that spend credits. Built for
+    Game Review, where "claims against this collection" already IS the
+    per-user, per-game unlock count (one doc per user+game), so the free
+    tier can be counted directly off `collection` with no separate
+    counter needed.
+
+    Same claim-before-charge race safety as _claim_unlock: the (user_id +
+    doc_key) slot is claimed with an atomic insert first, so two
+    concurrent requests for the same doc_key can't both see "not yet
+    claimed". If a fresh charge is then attempted and fails, the claim is
+    rolled back immediately.
+
+    Returns {"already_unlocked": bool, "unlock": dict, "spend": dict|None,
+    "paid": bool}. Raises whatever spend_credits() raises (e.g.
+    HTTPException 402) if a fresh paid charge fails.
+    """
+    existing = await collection.find_one({"user_id": user_id, **doc_key}, {"_id": 0})
+    if existing:
+        return {"already_unlocked": True, "unlock": existing, "spend": None, "paid": bool(existing.get("paid"))}
+
+    claim_doc = {
+        "user_id": user_id,
+        **doc_key,
+        "tx_id": None,
+        "paid": False,
+        "claimed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        await collection.insert_one(dict(claim_doc))
+    except DuplicateKeyError:
+        # Lost the race to a concurrent request for the same unlock -
+        # that request is the one paying for it, not us.
+        existing = await collection.find_one({"user_id": user_id, **doc_key}, {"_id": 0})
+        return {"already_unlocked": True, "unlock": existing, "spend": None, "paid": bool((existing or {}).get("paid"))}
+
+    # This claim is now counted in `collection`, so subtract 1 to get the
+    # count of claims that existed BEFORE it, which is what decides
+    # whether this one falls inside the free tier.
+    prior_count = await collection.count_documents({"user_id": user_id}) - 1
+    paid = prior_count >= free_limit
+
+    spend_result = None
+    if paid:
+        try:
+            spend_result = await spend_credits(user_id, feature_key, reference_id=reference_id, metadata=doc_key)
+        except HTTPException:
+            await collection.delete_one({"user_id": user_id, **doc_key})
+            raise
+
+    await collection.update_one(
+        {"user_id": user_id, **doc_key},
+        {"$set": {"tx_id": spend_result["tx_id"] if spend_result else None, "paid": paid}},
+    )
+    claim_doc["tx_id"] = spend_result["tx_id"] if spend_result else None
+    claim_doc["paid"] = paid
+    return {"already_unlocked": False, "unlock": claim_doc, "spend": spend_result, "paid": paid}
+
+
+async def _refund_unlock_claim(
+    collection,
+    user_id: str,
+    doc_key: dict,
+    claim_result: dict,
+    feature_key: str,
+    reason: str,
+) -> None:
+    """Undo a claim made by _claim_unlock / _claim_unlock_with_free_tier
+    when the gated action it was paying for turned out to fail. Deletes
+    the claim doc (freeing the slot so the user can retry without being
+    treated as "already unlocked") and, if credits were actually spent,
+    refunds them via an explicit "refund" ledger entry. A no-op if the
+    claim was for an already-existing unlock (claim_result["already_unlocked"]
+    is True) - that one wasn't newly charged by this request, so there's
+    nothing for this request to refund or delete.
+    """
+    if claim_result.get("already_unlocked"):
+        return
+    await collection.delete_one({"user_id": user_id, **doc_key})
+    spend = claim_result.get("spend")
+    if spend and spend.get("cost"):
+        await grant_credits(
+            user_id, spend["cost"], "refund",
+            reference_id=spend.get("tx_id"),
+            metadata={"feature_key": feature_key, "reason": reason, **doc_key},
+        )
+
+
+async def _consume_lifetime_budget(user_id: str, budget_key: str, free_limit: int, feature_key: str, reference_id: Optional[str] = None) -> dict:
+    """Lifetime (never-resetting) counterpart to _consume_daily_budget /
+    _consume_monthly_budget, for features with no natural per-document
+    dedup key to count against (unlike Game Review, every Board Editor
+    analysis is a fresh billable action, not "unlock this game forever").
+    Tracked on db.feature_usage_counters, one doc per user, one counter
+    field per budget_key so multiple lifetime budgets can share the
+    collection without colliding.
+
+    Call this BEFORE the action it gates. Does NOT increment the counter
+    itself - call _record_lifetime_usage after the gated action actually
+    succeeds, so a failed or unpaid-for action never counts against the
+    free allowance (matching the "refund on failure" requirement: a
+    request that fails after being charged is refunded in full and also
+    doesn't burn a free use).
+    """
+    doc = await db.feature_usage_counters.find_one({"user_id": user_id}, {"_id": 0}) or {}
+    used = doc.get(f"{budget_key}_count", 0)
+
+    if used < free_limit:
+        return {"paid": False, "used": used, "free_limit": free_limit, "spend": None}
+
+    spend_result = await spend_credits(user_id, feature_key, reference_id=reference_id, metadata={"budget_key": budget_key})
+    return {"paid": True, "used": used, "free_limit": free_limit, "spend": spend_result}
+
+
+async def _record_lifetime_usage(user_id: str, budget_key: str) -> None:
+    """Increments the lifetime usage counter for _consume_lifetime_budget -
+    call only after the gated action actually succeeded."""
+    await db.feature_usage_counters.update_one(
+        {"user_id": user_id},
+        {"$inc": {f"{budget_key}_count": 1}},
+        upsert=True,
+    )
+
+
+async def _refund_lifetime_spend(user_id: str, spend_result: Optional[dict], feature_key: str, reason: str) -> None:
+    """Refunds a charge made by _consume_lifetime_budget when the action it
+    was paying for failed. No-op if the budget call didn't actually spend
+    anything (the use was free)."""
+    if spend_result and spend_result.get("cost"):
+        await grant_credits(
+            user_id, spend_result["cost"], "refund",
+            reference_id=spend_result.get("tx_id"),
+            metadata={"feature_key": feature_key, "reason": reason},
+        )
+
+
 def _parse_pgn_to_uci_moves(pgn_text: str):
     """Parse a PGN string into (uci_moves, starting_fen). starting_fen is
     None when the game starts from the standard position. Raises
@@ -4931,89 +5142,77 @@ def _parse_pgn_to_uci_moves(pgn_text: str):
     return uci_moves, starting_fen
 
 
-# ---- Deep/cloud analysis on the user's own saved games ----
-# Distinct from the standard /games/{game_id}/analysis review above: this
-# runs at a much higher depth and is billed separately (feature key
-# "deep_analysis") and per-user, since deep analysis of a specific game
-# is framed in the spec as an upgrade on top of the basic review, not a
-# replacement for it. Restricted to games the requester actually played
-# in - "saved games" means the user's own games, not spectated ones.
+class BoardAnalyzeRequest(BaseModel):
+    fen: str
+    multi_pv: int = 3
 
-@api_router.post("/games/{game_id}/deep-analysis")
-async def deep_analyze_game(game_id: str, request: Request):
+
+# ---- Board Editor position analysis ----
+# The Board Editor's "Analyze" button, for arbitrary custom positions (not
+# tied to any saved game). Always runs Stockfish at deep depth
+# (ANALYSIS_DEPTH) - there's no separate "quick preview" tier here. Gated
+# by its own lifetime allowance (feature/budget key "board_analysis"):
+# the user's first BOARD_ANALYSIS_FREE_LIMIT analyses are free, every one
+# after that costs credits.
+#
+# This is deliberately a NEW, separate endpoint from POST /computer/move
+# (which the Board Editor's Analyze button used to call). /computer/move
+# stays exactly as it is and is NOT credit-gated, because it also powers
+# the actual computer-opponent move generation in Play vs Computer -
+# gating it would have started charging people for playing bot games.
+@api_router.post("/board/analyze")
+async def analyze_board_position(analyze_req: BoardAnalyzeRequest, request: Request):
     user = await get_current_user(request)
-    game = await db.games.find_one({"game_id": game_id}, {"_id": 0})
-    if not game:
-        raise HTTPException(status_code=404, detail="Game not found")
-    if game.get("status") != "completed":
-        raise HTTPException(status_code=403, detail="Deep analysis is only available for completed games")
-
-    participant_ids = {
-        (game.get("white_player") or {}).get("user_id"),
-        (game.get("black_player") or {}).get("user_id"),
-    }
-    if user["user_id"] not in participant_ids:
-        raise HTTPException(status_code=403, detail="Deep analysis is only available for your own games")
-
-    moves = game.get("moves", [])
-    if not moves:
-        raise HTTPException(status_code=400, detail="Game has no moves to analyze")
-
-    claim = await _claim_unlock(
-        db.deep_analysis_unlocks, user["user_id"], {"game_id": game_id},
-        "deep_analysis", reference_id=game_id,
-    )
-
-    if game.get("deep_analysis"):
-        return {"success": True, "analysis": game["deep_analysis"], "already_unlocked": claim["already_unlocked"]}
 
     if not STOCKFISH_AVAILABLE:
         raise HTTPException(status_code=503, detail="Stockfish engine not available")
 
-    starting_fen = game.get("initial_fen") if game.get("initial_fen") else None
-    lock = _get_analysis_lock(f"{game_id}:deep")
-    async with lock:
-        fresh_game = await db.games.find_one({"game_id": game_id}, {"_id": 0, "deep_analysis": 1})
-        if fresh_game and fresh_game.get("deep_analysis"):
-            return {"success": True, "analysis": fresh_game["deep_analysis"], "already_unlocked": claim["already_unlocked"]}
-        analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, DEEP_ANALYSIS_DEPTH)
+    try:
+        import chess
+        chess.Board(analyze_req.fen)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid FEN")
 
-    if not analysis.get("engine_available"):
-        raise HTTPException(status_code=503, detail=analysis.get("error", "Deep analysis failed"))
-
-    analysis_doc = {
-        "analysis_id": f"dan_{uuid.uuid4().hex[:12]}",
-        "game_id": game_id,
-        "depth": analysis.get("depth", DEEP_ANALYSIS_DEPTH),
-        "summary": analysis.get("summary"),
-        "moves": analysis.get("moves"),
-        "engine_available": True,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.games.update_one({"game_id": game_id}, {"$set": {"deep_analysis": analysis_doc}})
-    return {"success": True, "analysis": analysis_doc, "already_unlocked": claim["already_unlocked"]}
-
-
-@api_router.get("/games/{game_id}/deep-analysis")
-async def get_deep_analysis(game_id: str, request: Request):
-    """Retrieve deep analysis for a game the user has already unlocked.
-    Read-only - never spends credits. Unlock/compute happens via POST."""
-    user = await get_current_user(request)
-    unlock = await db.deep_analysis_unlocks.find_one(
-        {"user_id": user["user_id"], "game_id": game_id}, {"_id": 0}
+    # Checked BEFORE spending anything, same reasoning as Game Review:
+    # a user shouldn't burn a free use or get charged for an analysis
+    # that can't actually run.
+    budget = await _consume_lifetime_budget(
+        user["user_id"], "board_analysis", BOARD_ANALYSIS_FREE_LIMIT,
+        "board_analysis", reference_id=analyze_req.fen,
     )
-    if not unlock:
-        cost = await get_credit_feature_cost("deep_analysis")
-        raise HTTPException(status_code=402, detail={
-            "error": "not_unlocked",
-            "feature_key": "deep_analysis",
-            "cost": cost,
-        })
 
-    game = await db.games.find_one({"game_id": game_id}, {"_id": 0, "deep_analysis": 1})
-    if not game or not game.get("deep_analysis"):
-        raise HTTPException(status_code=404, detail="Deep analysis not yet computed - POST to this URL to run it")
-    return {"analysis": game["deep_analysis"]}
+    try:
+        local_engine = Stockfish(path=STOCKFISH_PATH, depth=ANALYSIS_DEPTH, parameters={"Threads": 2, "Hash": 128})
+        local_engine.set_fen_position(analyze_req.fen)
+        best_move = local_engine.get_best_move()
+        evaluation = local_engine.get_evaluation() or {}
+        multi_pv = analyze_req.multi_pv if analyze_req.multi_pv and analyze_req.multi_pv > 1 else 1
+        top_moves = local_engine.get_top_moves(multi_pv) if multi_pv > 1 else []
+        if not best_move:
+            raise RuntimeError("Stockfish returned no move for this position")
+    except Exception as e:
+        logger.error(f"Board Editor analysis failed: {e}")
+        # All credits refunded if the analysis fails - and if it was a
+        # free use, it isn't burned either (we never call
+        # _record_lifetime_usage below in that case).
+        await _refund_lifetime_spend(user["user_id"], budget["spend"], "board_analysis", reason=str(e))
+        raise HTTPException(status_code=503, detail="Deep analysis failed - any credits charged have been refunded")
+
+    await _record_lifetime_usage(user["user_id"], "board_analysis")
+
+    free_remaining = 0 if budget["paid"] else max(0, BOARD_ANALYSIS_FREE_LIMIT - (budget["used"] + 1))
+
+    return {
+        "move": best_move,
+        "evaluation": evaluation,
+        "top_moves": top_moves,
+        "depth": ANALYSIS_DEPTH,
+        "engine_available": True,
+        "paid": budget["paid"],
+        "cost": budget["spend"]["cost"] if budget["spend"] else 0,
+        "free_uses_remaining": free_remaining,
+        "free_limit": BOARD_ANALYSIS_FREE_LIMIT,
+    }
 
 
 # ---- Deep/cloud analysis on imported PGNs ----
@@ -7177,8 +7376,13 @@ async def startup_tasks():
     # pattern race-safe - a duplicate insert means a concurrent request
     # already won the claim.
     await db.game_review_unlocks.create_index([("user_id", 1), ("game_id", 1)], unique=True)
-    await db.deep_analysis_unlocks.create_index([("user_id", 1), ("game_id", 1)], unique=True)
     await db.pgn_analysis_cache.create_index([("user_id", 1), ("pgn_hash", 1)], unique=True)
+
+    # Board Editor analysis (and any other future lifetime-free-then-paid
+    # feature with no natural per-document dedup key) tracks its usage
+    # counters here - see _consume_lifetime_budget's docstring.
+    await db.feature_usage_counters.create_index("user_id", unique=True)
+    await db.migrations.create_index("migration_id", unique=True)
 
     # Phase 4b: puzzle pack unlocks (persistent, like the unlocks above -
     # you buy a difficulty tier once and keep it). Daily retry/skip
@@ -7218,15 +7422,14 @@ async def startup_tasks():
         upsert=True,
     )
 
-    # Phase 4a: initial prices for game review/deep analysis/PGN deep
-    # analysis/opening explorer depth. Same $setOnInsert + upsert pattern
-    # as 4b/4c/4d/4e - without this, spend_credits() 500s on all four
-    # feature keys (no configured cost) and Phase 4a is dead on arrival.
-    # Never overwrites a price an admin has since changed via
+    # Phase 4a: initial prices for game review/PGN deep analysis/opening
+    # explorer depth. Same $setOnInsert + upsert pattern as 4b/4c/4d/4e -
+    # without this, spend_credits() 500s on these feature keys (no
+    # configured cost) and Phase 4a is dead on arrival. Never overwrites a
+    # price an admin has since changed via
     # PUT /admin/credit-feature-costs/{feature_key}.
     phase_4a_costs = {
-        "game_review": 20,
-        "deep_analysis": 30,
+        "board_analysis": 30,
         "pgn_deep_analysis": 30,
         "opening_explorer_deep": 5,
     }
@@ -7243,6 +7446,36 @@ async def startup_tasks():
             },
             upsert=True,
         )
+
+    # Game Review pricing model migration: it used to be a flat 20-credit
+    # per-game unlock (feature_key "game_review") alongside a separate,
+    # extra-cost "deep_analysis" upgrade. Both are now merged: game_review
+    # is a single 5-free-then-30-credit allowance running at deep depth.
+    # This is a genuine one-time pricing/behavior change, not just a
+    # first-time default, so it's force-set the FIRST time the server
+    # boots with this code - guarded by a migrations flag so it doesn't
+    # clobber an admin's price change on every subsequent restart the way
+    # a plain $set on every boot would.
+    migration_key = "game_review_deep_merge_v1"
+    already_migrated = await db.migrations.find_one({"migration_id": migration_key}, {"_id": 0})
+    if not already_migrated:
+        await db.credit_feature_costs.update_one(
+            {"feature_key": "game_review"},
+            {
+                "$set": {
+                    "feature_key": "game_review",
+                    "cost": 30,
+                    "category": "analysis",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
+        )
+        await db.credit_feature_costs.delete_one({"feature_key": "deep_analysis"})
+        await db.migrations.insert_one({
+            "migration_id": migration_key,
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+        })
 
     # Phase 4b: initial prices for puzzle retries/skips/packs. $setOnInsert
     # + upsert so this only sets a price the first time a feature_key is

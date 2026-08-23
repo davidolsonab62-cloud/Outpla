@@ -145,9 +145,6 @@ export default function Game() {
   const [analysis, setAnalysis] = useState(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
-  const [deepAnalysis, setDeepAnalysis] = useState(null);
-  const [deepAnalysisLoading, setDeepAnalysisLoading] = useState(false);
-  const [deepAnalysisError, setDeepAnalysisError] = useState(null);
 
   // Sound and vibration settings
   const [settings, setSettings] = useState(() => getSettings());
@@ -258,7 +255,7 @@ export default function Game() {
       console.warn("Analysis fetch failed:", error);
       const detail = error?.response?.data?.detail;
       if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
-        toast.error(`Not enough credits — the game review costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
+        toast.error(`Not enough credits — the game review costs ${detail.cost} credits after your 5 free reviews (you have ${detail.credits_balance}).`, {
           action: { label: "Buy credits", onClick: () => navigate("/wallet") },
         });
         setAnalysisError("insufficient_credits");
@@ -277,39 +274,6 @@ export default function Game() {
       setAnalysisLoading(false);
     }
   }, [gameId, token]);
-
-  // Deep/cloud re-analysis (depth 20) of one of the user's own completed
-  // games - a separate paid unlock from the standard review above (Phase
-  // 4a). Unlike fetchAnalysis, this always POSTs: the endpoint itself is
-  // idempotent (no second charge if already unlocked) and returns the
-  // result directly, so there's no separate "check first" GET needed here.
-  const runDeepAnalysis = useCallback(async () => {
-    if (!gameId || !token) return;
-    setDeepAnalysisLoading(true);
-    setDeepAnalysisError(null);
-    try {
-      const response = await axios.post(
-        `${API}/games/${gameId}/deep-analysis`,
-        {},
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      setDeepAnalysis(response.data.analysis);
-    } catch (error) {
-      console.warn("Deep analysis failed:", error);
-      const detail = error?.response?.data?.detail;
-      if (error?.response?.status === 402 && detail?.error === "insufficient_credits") {
-        toast.error(`Not enough credits — deep analysis costs ${detail.cost} credits (you have ${detail.credits_balance}).`, {
-          action: { label: "Buy credits", onClick: () => navigate("/wallet") },
-        });
-        setDeepAnalysisError("insufficient_credits");
-      } else {
-        const message = detail?.detail || detail || error?.message || "Deep analysis unavailable";
-        setDeepAnalysisError(message);
-      }
-    } finally {
-      setDeepAnalysisLoading(false);
-    }
-  }, [gameId, token, navigate]);
 
   const fetchGame = useCallback(async () => {
     if (isImportedPgn) {
@@ -1361,22 +1325,19 @@ export default function Game() {
   const [rematchLoading, setRematchLoading] = useState(false);
   const [rematchSent, setRematchSent] = useState(false);
   const [rematchCost, setRematchCost] = useState(null);
-  const [deepAnalysisCost, setDeepAnalysisCost] = useState(null);
 
-  // Phase 5: show cost before the user commits, for the two Phase 4a/4c
-  // gated actions on this page that are a discrete opt-in button click
-  // (unlike the standard review, which auto-fetches once per game and is
-  // idempotently free after the first view - there's no separate "commit"
-  // moment to show a price ahead of).
+  // Phase 5: show cost before the user commits, for the Phase 4c gated
+  // action on this page that's a discrete opt-in button click (unlike the
+  // standard review, which auto-fetches once per game and is idempotently
+  // free after the first view - there's no separate "commit" moment to
+  // show a price ahead of). Game Review's own cost/free-uses info comes
+  // back inline on the /games/{game_id}/analysis response instead - see
+  // fetchAnalysis.
   useEffect(() => {
     if (!token) return;
     axios
       .get(`${API}/credits/feature-costs/rematch_token`, { headers: { Authorization: `Bearer ${token}` } })
       .then((response) => setRematchCost(response.data.cost))
-      .catch(() => {});
-    axios
-      .get(`${API}/credits/feature-costs/deep_analysis`, { headers: { Authorization: `Bearer ${token}` } })
-      .then((response) => setDeepAnalysisCost(response.data.cost))
       .catch(() => {});
   }, [token]);
 
@@ -2260,7 +2221,9 @@ export default function Game() {
                     <div className="space-y-3">
                       <div className="bg-brand-dim border border-brand rounded-sm p-3">
                         <p className="text-sm text-ink font-semibold">Unlock this game's review</p>
-                        <p className="text-xs text-ink-secondary mt-1">Spend a few credits to see blunder detection, accuracy, and move-by-move annotations for this game.</p>
+                        <p className="text-xs text-ink-secondary mt-1">
+                          Your free reviews are used up. Spend credits to see deep-engine blunder detection, accuracy, and move-by-move annotations for this game.
+                        </p>
                       </div>
                       <Button
                         onClick={() => navigate("/wallet")}
@@ -2356,89 +2319,6 @@ export default function Game() {
                 </div>
               )}
             </div>
-
-            {/* Deep/cloud analysis (Phase 4a) — own games only, separate
-                paid unlock from the standard review above. */}
-            {canShowAnalysis && !isImportedPgn && playerColor && (
-              <div className="bg-surface-1 border border-hair rounded-sm p-4">
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-ink font-semibold text-sm">Deep Analysis</h3>
-                  {deepAnalysis && (
-                    <Button
-                      onClick={runDeepAnalysis}
-                      size="sm"
-                      variant="outline"
-                      className="bg-transparent border-hair text-ink hover:bg-surface-2"
-                      disabled={deepAnalysisLoading}
-                    >
-                      Refresh
-                    </Button>
-                  )}
-                </div>
-
-                {deepAnalysisLoading ? (
-                  <div className="text-ink-secondary text-sm">Running deep analysis, please wait...</div>
-                ) : deepAnalysisError === "insufficient_credits" ? (
-                  <div className="space-y-3">
-                    <div className="bg-brand-dim border border-brand rounded-sm p-3">
-                      <p className="text-sm text-ink font-semibold">Unlock deeper analysis</p>
-                      <p className="text-xs text-ink-secondary mt-1">
-                        Go beyond the standard review with a much deeper engine pass on this game.
-                        {deepAnalysisCost != null ? ` Costs ${deepAnalysisCost} credits.` : ""}
-                      </p>
-                    </div>
-                    <Button
-                      onClick={() => navigate("/wallet")}
-                      size="sm"
-                      className="w-full bg-brand text-brand-on hover:bg-brand-hover"
-                    >
-                      Buy credits
-                    </Button>
-                  </div>
-                ) : deepAnalysisError ? (
-                  <div className="space-y-2">
-                    <div className="text-sm text-danger">{deepAnalysisError}</div>
-                    <Button
-                      onClick={runDeepAnalysis}
-                      size="sm"
-                      variant="outline"
-                      className="bg-transparent border-hair text-ink hover:bg-surface-2"
-                    >
-                      Retry
-                    </Button>
-                  </div>
-                ) : deepAnalysis ? (
-                  <div className="space-y-3 text-sm font-mono">
-                    <div className="grid grid-cols-2 gap-2">
-                      <div className="bg-surface-2 rounded-sm p-3">
-                        <p className="text-ink-secondary text-xs uppercase">Depth</p>
-                        <p className="text-ink text-lg font-semibold">{deepAnalysis.depth}</p>
-                      </div>
-                      <div className="bg-surface-2 rounded-sm p-3">
-                        <p className="text-ink-secondary text-xs uppercase">Blunders</p>
-                        <p className="text-danger text-lg font-semibold">{deepAnalysis.summary?.blunder ?? 0}</p>
-                      </div>
-                    </div>
-                    <p className="text-xs text-ink-secondary">
-                      {deepAnalysis.summary?.best ?? 0} best · {deepAnalysis.summary?.mistake ?? 0} mistakes · {deepAnalysis.summary?.inaccuracy ?? 0} inaccuracies
-                    </p>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    <p className="text-ink-secondary text-sm">
-                      Get a deeper Stockfish pass (depth {`>`}12) on this game beyond the standard review.
-                    </p>
-                    <Button
-                      onClick={runDeepAnalysis}
-                      size="sm"
-                      className="w-full bg-brand text-brand-on hover:bg-brand-hover"
-                    >
-                      {`Run Deep Analysis${deepAnalysisCost != null ? ` (${deepAnalysisCost} cr)` : ""}`}
-                    </Button>
-                  </div>
-                )}
-              </div>
-            )}
 
             {/* Move History */}
             <div className="bg-surface-1 border border-hair rounded-sm">

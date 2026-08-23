@@ -402,37 +402,6 @@ export default function Sidebar({ collapsed, onToggle, mobileOpen = false, onMob
         </div>
       )}
 
-      {/* Phase 5: credits balance persistently visible alongside wallet
-          balance (locked decision: 100 credits = $1, wallet -> credits is
-          one-way, so showing both together makes that exchange visible
-          without implying credits ever convert back). Links to /wallet,
-          same as the existing nav item, so tapping either gets you to the
-          Buy Credits flow. */}
-      {user && (
-        <Link
-          to="/wallet"
-          onClick={onMobileClose}
-          title={compact ? `${(user.wallet_balance?.USDT ?? 0).toFixed(2)} USDT · ${(user.credits_balance ?? 0).toLocaleString()} credits` : undefined}
-          className={`flex items-center rounded-[9px] no-underline sc-nav-row ${compact ? "justify-center p-1.5" : "justify-between gap-2 px-2 py-2 mt-1"}`}
-          style={{ background: "var(--surface-1)", border: "1px solid var(--hairline)" }}
-        >
-          {compact ? (
-            <span className="text-[11px] font-semibold" style={{ color: "var(--brand)" }}>
-              {(user.credits_balance ?? 0) >= 1000 ? `${Math.round((user.credits_balance ?? 0) / 1000)}k` : user.credits_balance ?? 0}
-            </span>
-          ) : (
-            <>
-              <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>
-                💰 {(user.wallet_balance?.USDT ?? 0).toFixed(2)} USDT
-              </span>
-              <span className="text-[12px] font-semibold" style={{ color: "var(--brand)" }}>
-                💎 {(user.credits_balance ?? 0).toLocaleString()} cr
-              </span>
-            </>
-          )}
-        </Link>
-      )}
-
       <div style={{ borderTop: "1px solid var(--hairline)", marginTop: 12, paddingTop: 12 }}>
         {compact ? (
           <nav className="flex flex-col gap-0.5">
