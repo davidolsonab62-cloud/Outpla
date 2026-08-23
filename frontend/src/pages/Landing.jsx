@@ -55,44 +55,33 @@ const STATS = [
    Hero art.
 
    This is the rendered 3D chess scene (raytraced lighting, depth of
-   field, the glowing ring under the king). Both themes now play a
-   short looping animation of the scene (pieces sliding/settling with
-   purple light trails) instead of a static frame — served as MP4
-   (dark ~1.4MB, light ~1.1MB) from /public, with the original WebP
-   stills kept as each <video>'s poster/fallback frame for first
-   paint, slow connections, and reduced-motion. Restored from an
-   earlier version of this page in place of the animated CSS board /
-   WebGL HeroBoard3D that briefly replaced it.
+   field, the glowing ring under the king). It's a real image rather
+   than CSS/SVG because that look can't be faithfully reproduced with
+   vector shapes — served as WebP (~45KB) from /public. Restored from
+   an earlier version of this page in place of the animated CSS board
+   / WebGL HeroBoard3D that briefly replaced it.
+
+   (An animated MP4 version of both themes was built and wired in
+   here for a while — /hero-chess-dark.mp4 and /hero-chess-light.mp4,
+   both watermark-cleaned PixVerse V6 generations of pieces sliding
+   with a purple light trail. Pulled back out in favor of the plain
+   stills below; the video assets and the <video>/poster wiring
+   aren't deleted from the codebase, just unhooked from this
+   component, in case they're wanted again later.)
    --------------------------------------------------------------- */
 function HeroBoard() {
   const { theme } = useTheme();
-  // Dark mode: /hero-chess-dark.mp4, poster'd with /hero-chess.webp
-  // (baked-in dark background + glow, with a large empty canvas
-  // margin the sizing below was tuned to bleed off-panel).
-  // Light mode: /hero-chess-light.mp4, poster'd with
-  // /hero-chess-light.webp (transparent background, tightly cropped
-  // to the actual pieces/board with almost no margin). It can't reuse
-  // the dark asset's oversized/shifted sizing - blowing a
-  // tightly-cropped image up to 118% and shifting it -8% right pushes
-  // the king and board edge past the panel's overflow-hidden bounds,
-  // cropping it on both desktop and mobile.
+  // Same rendered chess scene, two versions: /hero-chess.webp for dark
+  // mode (baked-in dark background + glow, with a large empty canvas
+  // margin the old sizing below was tuned to bleed off-panel) and
+  // /hero-chess-light.webp for light mode (transparent background,
+  // tightly cropped to the actual pieces/board with almost no margin).
+  // The light asset can't reuse the dark asset's oversized/shifted
+  // sizing - blowing a tightly-cropped image up to 118% and shifting it
+  // -8% right pushes the king and board edge past the panel's
+  // overflow-hidden bounds, cropping it on both desktop and mobile.
   const isLight = theme === "light";
-  const heroImgSrc = isLight ? "/hero-chess-light.webp" : "/hero-chess.webp";
-  const heroVideoSrc = isLight ? "/hero-chess-light.mp4" : "/hero-chess-dark.mp4";
-  const prefersReducedMotion = useReducedMotion();
-
-  const heroClassName = isLight
-    ? "relative h-auto select-none w-full max-w-none"
-    : "relative h-auto select-none w-[118%] max-w-none -mr-[8%] md:-mt-6";
-
-  // feather the edges so the render blends into the hero panel instead
-  // of sitting in an obvious rectangle
-  const heroMaskStyle = {
-    maskImage:
-      "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)",
-    WebkitMaskImage:
-      "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)",
-  };
+  const heroSrc = isLight ? "/hero-chess-light.webp" : "/hero-chess.webp";
 
   return (
     <div className="relative w-full">
@@ -104,30 +93,25 @@ function HeroBoard() {
             "radial-gradient(ellipse at 55% 60%, rgba(124,92,252,.38), rgba(124,92,252,.10) 45%, transparent 70%)",
         }}
       />
-      {!prefersReducedMotion ? (
-        <video
-          key={heroVideoSrc}
-          className={heroClassName}
-          style={heroMaskStyle}
-          poster={heroImgSrc}
-          src={heroVideoSrc}
-          autoPlay
-          loop
-          muted
-          playsInline
-          preload="auto"
-          aria-label="Chess king spotlit on a board, surrounded by other pieces as they make a move"
-        />
-      ) : (
-        <img
-          key={heroImgSrc}
-          src={heroImgSrc}
-          alt="Chess king spotlit on a board, surrounded by other pieces"
-          className={heroClassName}
-          draggable="false"
-          style={heroMaskStyle}
-        />
-      )}
+      <img
+        key={heroSrc}
+        src={heroSrc}
+        alt="Chess king spotlit on a board, surrounded by other pieces"
+        className={
+          isLight
+            ? "relative h-auto select-none w-full max-w-none"
+            : "relative h-auto select-none w-[118%] max-w-none -mr-[8%] md:-mt-6"
+        }
+        draggable="false"
+        style={{
+          /* feather the edges so the render blends into the hero panel
+             instead of sitting in an obvious rectangle */
+          maskImage:
+            "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)",
+          WebkitMaskImage:
+            "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)",
+        }}
+      />
     </div>
   );
 }
