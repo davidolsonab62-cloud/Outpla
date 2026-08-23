@@ -5180,14 +5180,24 @@ async def analyze_board_position(analyze_req: BoardAnalyzeRequest, request: Requ
     )
 
     try:
-        local_engine = Stockfish(path=STOCKFISH_PATH, depth=ANALYSIS_DEPTH, parameters={"Threads": 2, "Hash": 128})
-        local_engine.set_fen_position(analyze_req.fen)
-        best_move = local_engine.get_best_move()
-        evaluation = local_engine.get_evaluation() or {}
-        multi_pv = analyze_req.multi_pv if analyze_req.multi_pv and analyze_req.multi_pv > 1 else 1
-        top_moves = local_engine.get_top_moves(multi_pv) if multi_pv > 1 else []
-        if not best_move:
-            raise RuntimeError("Stockfish returned no move for this position")
+        # Run the blocking Stockfish call in a worker thread so it never
+        # freezes the event loop - see the identical fix + explanation on
+        # the Game Review analysis endpoint above (this endpoint had the
+        # same "call Stockfish directly in the async handler" bug, which
+        # stalls the ENTIRE server - including Socket.IO's polling
+        # keep-alives - for as long as the analysis takes).
+        def _run_board_analysis():
+            local_engine = Stockfish(path=STOCKFISH_PATH, depth=ANALYSIS_DEPTH, parameters={"Threads": 2, "Hash": 128})
+            local_engine.set_fen_position(analyze_req.fen)
+            best_move = local_engine.get_best_move()
+            evaluation = local_engine.get_evaluation() or {}
+            multi_pv = analyze_req.multi_pv if analyze_req.multi_pv and analyze_req.multi_pv > 1 else 1
+            top_moves = local_engine.get_top_moves(multi_pv) if multi_pv > 1 else []
+            if not best_move:
+                raise RuntimeError("Stockfish returned no move for this position")
+            return best_move, evaluation, top_moves
+
+        best_move, evaluation, top_moves = await asyncio.to_thread(_run_board_analysis)
     except Exception as e:
         logger.error(f"Board Editor analysis failed: {e}")
         # All credits refunded if the analysis fails - and if it was a
