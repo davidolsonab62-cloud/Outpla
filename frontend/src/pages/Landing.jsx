@@ -85,7 +85,7 @@ function HeroBoard() {
   const heroSrc = isLight ? "/hero-chess-light.webp" : "/hero-chess.webp";
 
   return (
-    <div className={isLight ? "relative w-full md:-ml-10 lg:-ml-16" : "relative w-full"}>
+    <div className={isLight ? "relative w-full md:-ml-16 lg:-ml-24" : "relative w-full"}>
       {/* glow bleeding out past the image edges, so it melts into the panel */}
       <div
         className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[125%] h-[125%]"
@@ -100,7 +100,7 @@ function HeroBoard() {
         alt="Chess king spotlit on a board, surrounded by other pieces"
         className={
           isLight
-            ? "relative h-auto select-none w-[120%] max-w-none -mr-[6%]"
+            ? "relative h-auto select-none w-[116%] max-w-none -mr-[3%]"
             : "relative h-auto select-none w-[118%] max-w-none -mr-[8%] md:-mt-6"
         }
         draggable="false"
