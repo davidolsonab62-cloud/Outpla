@@ -62,6 +62,13 @@ const STATS = [
    / WebGL HeroBoard3D that briefly replaced it.
    --------------------------------------------------------------- */
 function HeroBoard() {
+  const { theme } = useTheme();
+  // Same rendered chess scene, two versions: /hero-chess.webp for dark
+  // mode (baked-in dark background + glow) and /hero-chess-light.webp for
+  // light mode (transparent background, sits naturally on the light hero
+  // panel instead of showing a dark box around it).
+  const heroSrc = theme === "light" ? "/hero-chess-light.webp" : "/hero-chess.webp";
+
   return (
     <div className="relative w-full">
       {/* glow bleeding out past the image edges, so it melts into the panel */}
@@ -73,7 +80,8 @@ function HeroBoard() {
         }}
       />
       <img
-        src="/hero-chess.webp"
+        key={heroSrc}
+        src={heroSrc}
         alt="Chess king spotlit on a board, surrounded by other pieces"
         className="relative h-auto select-none w-[118%] max-w-none -mr-[8%] md:-mt-6"
         draggable="false"
