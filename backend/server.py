@@ -190,15 +190,13 @@ sio = socketio.AsyncServer(
 # Create the main app
 app = FastAPI(title="StakeChess API")
 
-# Add CORS middleware immediately so it applies to all routes
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=cors_origins_list,
-    allow_origin_regex=allow_origin_regex,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# NOTE: CORS is intentionally NOT added here. This FastAPI app gets wrapped
+# by socketio.ASGIApp and then by CORSMiddleware at the very bottom of this
+# file - that outer layer is the one that actually applies to every request
+# (both Socket.IO and REST). Adding it here too used to double up the
+# Access-Control-Allow-Origin header, which browsers treat as invalid and
+# reject outright - producing a "No Access-Control-Allow-Origin header"
+# CORS error in devtools even when the origin was correctly allow-listed.
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
