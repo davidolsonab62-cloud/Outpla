@@ -76,10 +76,14 @@ function HeroBoard() {
   // margin the old sizing below was tuned to bleed off-panel) and
   // /hero-chess-light.webp for light mode (transparent background,
   // tightly cropped to the actual pieces/board with almost no margin).
-  // The light asset can't reuse the dark asset's oversized/shifted
+  // The light asset can't reuse the dark asset's full oversized/shifted
   // sizing - blowing a tightly-cropped image up to 118% and shifting it
   // -8% right pushes the king and board edge past the panel's
-  // overflow-hidden bounds, cropping it on both desktop and mobile.
+  // overflow-hidden bounds, cropping it on both desktop and mobile. It
+  // can take a smaller bump though (112% / -3% shift) before that
+  // happens, since the panel still has a little breathing room on the
+  // right at md+ (pr-0 there vs pr-6 on mobile) - re-check both
+  // breakpoints if this ratio changes again.
   const isLight = theme === "light";
   const heroSrc = isLight ? "/hero-chess-light.webp" : "/hero-chess.webp";
 
@@ -99,7 +103,7 @@ function HeroBoard() {
         alt="Chess king spotlit on a board, surrounded by other pieces"
         className={
           isLight
-            ? "relative h-auto select-none w-full max-w-none"
+            ? "relative h-auto select-none w-[112%] max-w-none -mr-[3%]"
             : "relative h-auto select-none w-[118%] max-w-none -mr-[8%] md:-mt-6"
         }
         draggable="false"
