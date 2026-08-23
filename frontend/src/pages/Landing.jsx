@@ -71,21 +71,20 @@ const STATS = [
    --------------------------------------------------------------- */
 function HeroBoard() {
   const { theme } = useTheme();
-  // Same rendered chess scene, two versions: /hero-chess.webp for dark
-  // mode (baked-in dark background + glow, with a large empty canvas
-  // margin the old sizing below was tuned to bleed off-panel) and
-  // /hero-chess-light.webp for light mode (transparent background,
-  // tightly cropped to the actual pieces/board with almost no margin).
-  // The light asset can't reuse the dark asset's full oversized/shifted
-  // sizing - blowing a tightly-cropped image up too far or shifting it
-  // too far right pushes the king and board edge past the panel's
-  // overflow-hidden bounds, cropping it on both desktop and mobile.
-  // Re-check both breakpoints if either ratio changes again.
+  // Same rendered scene now, one asset for both themes:
+  // /hero-chess-light.webp (transparent background, tightly cropped).
+  // The old /hero-chess.webp (baked-in dark background + glow) is no
+  // longer referenced here but left in /public in case it's wanted
+  // again. Sizing/placement is still tuned per theme below - it's the
+  // same image either way, but light vs dark panel backgrounds can
+  // want different scale/position/feather to look intentional rather
+  // than pasted-on, so these numbers are independently adjustable.
+  // The dark values below start as a copy of light's; nudge to taste.
   const isLight = theme === "light";
-  const heroSrc = isLight ? "/hero-chess-light.webp" : "/hero-chess.webp";
+  const heroSrc = "/hero-chess-light.webp";
 
   return (
-    <div className={isLight ? "relative w-full md:-ml-16 lg:-ml-24" : "relative w-full"}>
+    <div className={isLight ? "relative w-full md:-ml-16 lg:-ml-24" : "relative w-full md:-ml-16 lg:-ml-24"}>
       {/* glow bleeding out past the image edges, so it melts into the panel */}
       <div
         className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[125%] h-[125%]"
@@ -101,16 +100,18 @@ function HeroBoard() {
         className={
           isLight
             ? "relative h-auto select-none w-[116%] max-w-none -mr-[3%]"
-            : "relative h-auto select-none w-[118%] max-w-none -mr-[8%] md:-mt-6"
+            : "relative h-auto select-none w-[116%] max-w-none -mr-[3%]"
         }
         draggable="false"
         style={{
           /* feather the edges so the render blends into the hero panel
              instead of sitting in an obvious rectangle */
-          maskImage:
-            "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)",
-          WebkitMaskImage:
-            "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)",
+          maskImage: isLight
+            ? "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)"
+            : "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)",
+          WebkitMaskImage: isLight
+            ? "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)"
+            : "radial-gradient(ellipse 78% 82% at 52% 52%, #000 58%, transparent 96%)",
         }}
       />
     </div>
