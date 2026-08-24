@@ -1391,7 +1391,12 @@ def analyze_game_with_stockfish(moves: List[str], starting_fen: str = None, dept
 
     try:
         from chess import Board
-        local_engine = Stockfish(path=STOCKFISH_PATH, depth=depth, parameters={"Threads": 2, "Hash": 128})
+        # Hash halved from the historical 128MB - see
+        # _stockfish_job_slots's docstring for why (memory headroom on a
+        # 512MB Render instance). Every caller of this function already
+        # goes through that semaphore, so at most one of these runs at a
+        # time regardless.
+        local_engine = Stockfish(path=STOCKFISH_PATH, depth=depth, parameters={"Threads": 2, "Hash": 64})
         board = Board() if not starting_fen else Board(fen=starting_fen)
         results = []
         summary = {"best": 0, "brilliant": 0, "inaccuracy": 0, "mistake": 0, "blunder": 0}
@@ -3094,7 +3099,10 @@ async def _run_game_review_job(job_id: str, game_id: str, creator_user_id: str, 
         moves = (game or {}).get("moves", [])
         starting_fen = (game or {}).get("initial_fen") or None
 
-        analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, ANALYSIS_DEPTH)
+        # See _stockfish_job_slots's docstring - caps how many of these
+        # run concurrently across every Board Editor/Game Review job.
+        async with _stockfish_job_slots:
+            analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, ANALYSIS_DEPTH)
 
         if not analysis.get("engine_available"):
             logger.warning(f"Stockfish analysis failed for game {game_id}: {analysis.get('error')}")
@@ -3245,7 +3253,10 @@ async def analyze_game(game_id: str, request: Request):
 
         # Game Review now always runs at deep depth (formerly the separate,
         # extra-cost "Deep Analysis" feature) - see ANALYSIS_DEPTH's docstring.
-        analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, ANALYSIS_DEPTH)
+        # Shares the same concurrency cap as the job-based path below -
+        # see _stockfish_job_slots's docstring.
+        async with _stockfish_job_slots:
+            analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, ANALYSIS_DEPTH)
 
     if not analysis.get("engine_available"):
         logger.warning(f"Stockfish analysis failed for game {game_id}: {analysis.get('error')}")
@@ -4998,6 +5009,41 @@ PGN_ANALYSIS_DEPTH = 18
 # looking deeper than that costs credits. "Basic depth" per the spec.
 OPENING_EXPLORER_FREE_PLY = 6
 
+# Caps how many of these deep (Hash: 128MB+) Stockfish subprocesses can
+# run at once - across Board Editor and Game Review's background jobs,
+# and the older synchronous Game Review / PGN-import analysis endpoints
+# that spawn the same kind of engine. Nothing bounded this before: each
+# caller spins up its own Stockfish process via asyncio.to_thread with
+# no shared limit, so N of these running at once means N x ~150-200MB
+# of engine memory on top of the app itself - easy to blow past a
+# memory-constrained host's limit (e.g. Render's smaller instance
+# tiers) well before any single analysis is slow or wrong. That failure
+# mode looks exactly like "Stockfish works, but the server keeps
+# randomly crashing and restarting" - the crash is memory pressure, not
+# a bad analysis.
+#
+# This matters even more with crash-resume in the picture:
+# _resume_orphaned_board_analysis_jobs / _resume_orphaned_game_review_jobs
+# can fire off asyncio.create_task for every job that was still pending
+# when the process died - potentially several at once, immediately at
+# startup, with no throttling of their own. Without this semaphore
+# that's a self-sustaining crash loop: the burst of concurrent Stockfish
+# processes that helped OOM the process the first time gets relaunched
+# in full the moment it restarts. Every caller acquires this before
+# starting its Stockfish subprocess, so only STOCKFISH_MAX_CONCURRENT
+# ever run at once no matter how many jobs got created/resumed/requested
+# simultaneously - the rest simply wait their turn.
+#
+# Default of 1 (not 2) is sized for a 512MB Render instance specifically:
+# base app memory (uvicorn/FastAPI/Motor/socketio/APScheduler + everything
+# else already loaded) plus even ONE Hash:64 engine process already
+# leaves little headroom on a 512MB box - two concurrent Hash:128
+# engines (the pre-fix setting) was comfortably enough on its own to
+# explain an exit-137 OOM kill. Bump this via the env var if/when this
+# service moves to a larger instance.
+STOCKFISH_MAX_CONCURRENT = int(os.environ.get("STOCKFISH_MAX_CONCURRENT", "1"))
+_stockfish_job_slots = asyncio.Semaphore(STOCKFISH_MAX_CONCURRENT)
+
 # Lifetime (not daily/monthly) free-use allowances before credits are
 # charged. Separate constants/budgets per spec - Board Editor analysis and
 # Game Review never share a counter, even though they're priced the same.
@@ -5323,7 +5369,8 @@ async def _run_board_analysis_job(job_id: str, fen: str, multi_pv: int, user_id:
     """
     try:
         def _run():
-            local_engine = Stockfish(path=STOCKFISH_PATH, depth=ANALYSIS_DEPTH, parameters={"Threads": 1, "Hash": 128})
+            # Hash halved from 128 - see _stockfish_job_slots's docstring.
+            local_engine = Stockfish(path=STOCKFISH_PATH, depth=ANALYSIS_DEPTH, parameters={"Threads": 1, "Hash": 64})
             local_engine.set_fen_position(fen)
             best_move = local_engine.get_best_move()
             evaluation = local_engine.get_evaluation() or {}
@@ -5332,7 +5379,10 @@ async def _run_board_analysis_job(job_id: str, fen: str, multi_pv: int, user_id:
                 raise RuntimeError("Stockfish returned no move for this position")
             return best_move, evaluation, top_moves
 
-        best_move, evaluation, top_moves = await asyncio.to_thread(_run)
+        # See _stockfish_job_slots's docstring - caps how many of these
+        # run concurrently across every Board Editor/Game Review job.
+        async with _stockfish_job_slots:
+            best_move, evaluation, top_moves = await asyncio.to_thread(_run)
 
         # Only the run that wins the settlement claim records the free/
         # paid use. free_remaining is still computed off budget["used"] -
@@ -5587,7 +5637,10 @@ async def analyze_imported_pgn(analyze_data: PGNAnalyzeRequest, request: Request
     if not STOCKFISH_AVAILABLE:
         raise HTTPException(status_code=503, detail="Stockfish engine not available")
 
-    analysis = await asyncio.to_thread(analyze_game_with_stockfish, uci_moves, starting_fen, PGN_ANALYSIS_DEPTH)
+    # Shares the same global concurrency cap as Board Editor/Game Review's
+    # background jobs - see _stockfish_job_slots's docstring.
+    async with _stockfish_job_slots:
+        analysis = await asyncio.to_thread(analyze_game_with_stockfish, uci_moves, starting_fen, PGN_ANALYSIS_DEPTH)
     if not analysis.get("engine_available"):
         raise HTTPException(status_code=503, detail=analysis.get("error", "PGN analysis failed"))
 
@@ -5819,7 +5872,16 @@ async def get_computer_move(move_req: ComputerMoveRequest):
         }
     
     try:
-        stockfish = Stockfish(path=STOCKFISH_PATH, depth=move_req.depth, parameters={"Threads": 2, "Hash": 128})
+        # Hash halved from 128 - see _stockfish_job_slots's docstring.
+        # Deliberately NOT routed through that semaphore, unlike the
+        # other three sites: this is real-time gameplay (a bot move,
+        # not a background review), usually much shallower/faster than
+        # ANALYSIS_DEPTH, and queuing it behind a slow deep review would
+        # stall active games. It still contributes to peak memory, so if
+        # crashes continue after the other changes, gating this one too
+        # (at the cost of bot-move latency during a concurrent review)
+        # or moving to a larger instance are the next levers to pull.
+        stockfish = Stockfish(path=STOCKFISH_PATH, depth=move_req.depth, parameters={"Threads": 2, "Hash": 64})
         stockfish.set_fen_position(move_req.fen)
 
         # Elo-targeted strength instead of the classic 0-20 Skill Level.
