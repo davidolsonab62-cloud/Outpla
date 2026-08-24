@@ -3059,11 +3059,134 @@ async def boost_game(game_id: str, request: Request):
     return {"success": True, "featured_until": featured_until, "spend": spend_result}
 
 
+async def _run_game_review_job(job_id: str, game_id: str, creator_user_id: str, creator_claim: dict):
+    """Runs Stockfish Game Review for `game_id` in the background, off
+    the request/response cycle, and writes the result onto the game
+    doc's "analysis" field for GET /games/{game_id}/analysis to pick up
+    (and delete the job doc once cached, same lifecycle as Board
+    Editor's per-analysis job docs - see that endpoint's comments).
+
+    Moved off a single blocking request for the same reason as Board
+    Editor's /board/analyze: a full-game deep (ANALYSIS_DEPTH) review
+    can run long enough on Render's shared/fractional CPU to blow past
+    Render's own proxy timeout, independent of anything in this app.
+
+    Unlike Board Editor jobs (one job = one user's one paid action),
+    a Game Review job's underlying computation is SHARED - it's cached
+    once per game and reused by every user who reviews that game - but
+    only the user whose request actually created the job (creator_*)
+    is refunded if it fails. Any other user who claimed their free/paid
+    use while this job was already pending keeps their claim (same as
+    the pre-existing in-process-lock behavior this replaces): since
+    _claim_unlock_with_free_tier is idempotent per user+game, they can
+    poll again for free and will get the analysis for free the moment
+    a later attempt succeeds, with nothing further charged either way.
+
+    Can run more than once for the same job_id if the process died
+    before finishing - see _resume_orphaned_game_review_jobs. The
+    refund-on-failure ledger effect is guarded by _claim_job_settlement
+    so a resumed replay that fails again doesn't refund the creator
+    twice; a successful write of the analysis doc is naturally safe to
+    repeat (same content each time).
+    """
+    try:
+        game = await db.games.find_one({"game_id": game_id}, {"_id": 0, "moves": 1, "initial_fen": 1})
+        moves = (game or {}).get("moves", [])
+        starting_fen = (game or {}).get("initial_fen") or None
+
+        analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, ANALYSIS_DEPTH)
+
+        if not analysis.get("engine_available"):
+            logger.warning(f"Stockfish analysis failed for game {game_id}: {analysis.get('error')}")
+            if creator_claim is not None and await _claim_job_settlement(db.game_review_jobs, job_id):
+                await _refund_unlock_claim(
+                    db.game_review_unlocks, creator_user_id, {"game_id": game_id},
+                    creator_claim, "game_review", reason=analysis.get("error", "stockfish_failed"),
+                )
+            await db.game_review_jobs.update_one(
+                {"job_id": job_id},
+                {"$set": {
+                    "status": "error",
+                    "error": analysis.get("error", "Stockfish analysis failed"),
+                    "updated_at": datetime.now(timezone.utc),
+                }},
+            )
+            return
+
+        analysis_doc = {
+            "analysis_id": f"an_{uuid.uuid4().hex[:12]}",
+            "game_id": game_id,
+            "depth": analysis.get("depth", ANALYSIS_DEPTH),
+            "summary": analysis.get("summary"),
+            "moves": analysis.get("moves"),
+            "engine_available": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.games.update_one({"game_id": game_id}, {"$set": {"analysis": analysis_doc}})
+        await db.game_review_jobs.delete_one({"job_id": job_id})
+    except Exception as e:
+        logger.exception(f"Exception during Game Review job for game {game_id}: {e}")
+        if creator_claim is not None and await _claim_job_settlement(db.game_review_jobs, job_id):
+            await _refund_unlock_claim(
+                db.game_review_unlocks, creator_user_id, {"game_id": game_id},
+                creator_claim, "game_review", reason=str(e),
+            )
+        await db.game_review_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {
+                "status": "error",
+                "error": str(e),
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+
+
+async def _resume_orphaned_game_review_jobs():
+    """Crash-resume for Game Review jobs - the same idea as
+    _resume_orphaned_board_analysis_jobs, applied to db.game_review_jobs.
+    Called once from startup_tasks(), before the app starts serving
+    traffic; see that function's docstring for why "pending" at this
+    exact moment can only mean "orphaned by a crash", never "still
+    legitimately running".
+    """
+    resumed = 0
+    async for job in db.game_review_jobs.find({"status": "pending"}):
+        job_id = job.get("job_id")
+        game_id = job.get("game_id")
+        creator_user_id = job.get("creator_user_id")
+        creator_claim = job.get("creator_claim")
+
+        if not job_id or not game_id:
+            # Malformed/pre-existing doc with nothing safe to resume -
+            # drop it rather than leave it stuck; the next request for
+            # this game (if any) will just create a fresh job normally.
+            if job_id:
+                await db.game_review_jobs.delete_one({"job_id": job_id})
+            continue
+
+        asyncio.create_task(
+            _run_game_review_job(job_id, game_id, creator_user_id, creator_claim)
+        )
+        resumed += 1
+
+    if resumed:
+        logger.info(f"Resumed {resumed} Game Review job(s) orphaned by a restart")
+
+
 @api_router.post("/games/{game_id}/analysis")
 async def analyze_game(game_id: str, request: Request):
-    """Run Stockfish Game Review (deep analysis, see ANALYSIS_DEPTH) for a
-    completed game and persist results. Gated by the game_review 5-free-
-    then-30-credit allowance."""
+    """Runs Game Review synchronously and returns the result directly.
+    Deep analysis (see ANALYSIS_DEPTH) for a completed game, gated by
+    the game_review 5-free-then-30-credit allowance.
+
+    Not called by the current frontend (which uses GET
+    /games/{game_id}/analysis's job-based flow below - see
+    _run_game_review_job) and left as-is for any other caller that
+    still expects a single blocking request/response. Because it's
+    synchronous, it does NOT go through db.game_review_jobs - no
+    crash-resume, and a long-running review here is still subject to
+    whatever request timeout sits in front of this app.
+    """
     user = await get_current_user(request)
     game = await db.games.find_one({"game_id": game_id}, {"_id": 0})
     if not game:
@@ -3170,7 +3293,11 @@ async def analyze_game(game_id: str, request: Request):
 
 @api_router.get("/games/{game_id}/analysis")
 async def get_game_analysis(game_id: str, request: Request):
-    """Retrieve stored analysis for a game. If none exists, run analysis (if allowed)."""
+    """Retrieve stored analysis for a game. If none exists, kick off (or
+    join) a background Game Review job and tell the frontend to keep
+    polling this same endpoint - see _run_game_review_job's docstring
+    for why this moved off a single blocking request/response, same
+    reasoning as Board Editor's /board/analyze."""
     user = await get_current_user(request)
     game = await db.games.find_one({"game_id": game_id}, {"_id": 0})
     if not game:
@@ -3211,7 +3338,10 @@ async def get_game_analysis(game_id: str, request: Request):
     # "game_review"). Applies whether analysis is already cached or still
     # needs computing - see _claim_unlock_with_free_tier's docstring.
     # Raises HTTPException(402) if the user is past their free reviews and
-    # doesn't have enough credits.
+    # doesn't have enough credits. Idempotent per user+game (the
+    # underlying claim doc is only ever inserted once), so calling this
+    # again on every poll - including polls that just join an
+    # already-running job - never double-charges the same user.
     claim = await _claim_unlock_with_free_tier(
         db.game_review_unlocks, user["user_id"], {"game_id": game_id},
         "game_review", GAME_REVIEW_FREE_LIMIT, "game_review", reference_id=game_id,
@@ -3220,50 +3350,20 @@ async def get_game_analysis(game_id: str, request: Request):
     if analysis:
         return {"analysis": analysis}
 
-    # If another request is already analyzing this exact game, don't start a second
-    # blocking Stockfish run — just tell the frontend to keep polling/waiting.
-    lock = _get_analysis_lock(game_id)
-    if lock.locked():
-        return {
-            "analysis": {
-                "analysis_id": f"an_{uuid.uuid4().hex[:12]}",
-                "game_id": game_id,
-                "depth": 0,
-                "summary": {"best": 0, "brilliant": 0, "inaccuracy": 0, "mistake": 0, "blunder": 0},
-                "moves": [],
-                "engine_available": True,
-                "in_progress": True,
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }
-        }
-
-    try:
-        async with lock:
-            # Re-check: another request may have just finished analyzing this game while we waited
-            fresh_game = await db.games.find_one({"game_id": game_id}, {"_id": 0, "analysis": 1})
-            if fresh_game and fresh_game.get("analysis"):
-                return {"analysis": fresh_game["analysis"]}
-
-            starting_fen = game.get("initial_fen") if game.get("initial_fen") else None
-            # Run the blocking Stockfish call in a worker thread so it never freezes
-            # the event loop (this was previously called directly, which stalled the
-            # ENTIRE server — including unrelated requests like fetching game state
-            # for the replay controls — for as long as the analysis took).
-            # Game Review now always runs at deep depth (formerly the separate,
-            # extra-cost "Deep Analysis" feature) - see ANALYSIS_DEPTH's docstring.
-            analysis = await asyncio.to_thread(analyze_game_with_stockfish, moves, starting_fen, ANALYSIS_DEPTH)
-
-        if not analysis.get("engine_available"):
-            logger.warning(f"Stockfish analysis failed for game {game_id}: {analysis.get('error')}")
-            # Undo the claim and refund any spend - see the POST handler's
-            # comment above for why this matters (this is the exact bug
-            # the old /deep-analysis endpoint had).
-            await _refund_unlock_claim(
-                db.game_review_unlocks, user["user_id"], {"game_id": game_id},
-                claim, "game_review", reason=analysis.get("error", "stockfish_failed"),
-            )
-            # Return graceful failure instead of 503. Deliberately NOT
-            # persisted to the game doc so a retry actually retries.
+    # No cached result yet. db.game_review_jobs is keyed uniquely on
+    # game_id - the Stockfish computation is shared/cached across every
+    # user reviewing this game, so at most one job (and one Stockfish
+    # run) should ever be in flight for it at a time, no matter how many
+    # users are simultaneously polling for it.
+    existing_job = await db.game_review_jobs.find_one({"game_id": game_id}, {"_id": 0})
+    if existing_job:
+        if existing_job["status"] == "error":
+            # Deliver the error once, then clear the job doc so the next
+            # request - automatic retry or the user's Refresh button -
+            # starts a fresh job instead of seeing the same stale error
+            # forever. Not persisted to the game doc, same as before, so
+            # a retry actually retries.
+            await db.game_review_jobs.delete_one({"game_id": game_id})
             return {
                 "analysis": {
                     "analysis_id": f"an_{uuid.uuid4().hex[:12]}",
@@ -3272,45 +3372,40 @@ async def get_game_analysis(game_id: str, request: Request):
                     "summary": {"best": 0, "brilliant": 0, "inaccuracy": 0, "mistake": 0, "blunder": 0},
                     "moves": [],
                     "engine_available": False,
-                    "error": analysis.get("error", "Stockfish analysis failed"),
-                    "created_at": datetime.now(timezone.utc).isoformat()
+                    "error": existing_job.get("error", "Stockfish analysis failed"),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
                 }
             }
+        # status "pending" - already running (by this process, another
+        # worker, or resumed after a restart). Nothing to do but tell the
+        # frontend to keep polling.
+        return {"status": "pending"}
 
-        analysis_doc = {
-            "analysis_id": f"an_{uuid.uuid4().hex[:12]}",
+    job_id = f"gr_{game_id}"
+    try:
+        await db.game_review_jobs.insert_one({
+            "job_id": job_id,
             "game_id": game_id,
-            "depth": analysis.get("depth", ANALYSIS_DEPTH),
-            "summary": analysis.get("summary"),
-            "moves": analysis.get("moves"),
-            "engine_available": True,
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
+            "status": "pending",
+            # The claim/refund pair for a Game Review failure is only
+            # ever applied to whichever user's request actually created
+            # the job - see _run_game_review_job's docstring for why
+            # that mirrors this endpoint's pre-existing behavior rather
+            # than refunding every user who happened to be polling.
+            "creator_user_id": user["user_id"],
+            "creator_claim": claim,
+            "settled": False,
+            "error": None,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        })
+    except DuplicateKeyError:
+        # Lost the race to a concurrent request for this exact game -
+        # that request's job is the one running now; just poll it.
+        return {"status": "pending"}
 
-        await db.games.update_one({"game_id": game_id}, {"$set": {"analysis": analysis_doc}})
-        return {"analysis": analysis_doc, "paid": claim["paid"], "already_unlocked": claim["already_unlocked"]}
-    except Exception as e:
-        logger.exception(f"Exception during analysis for game {game_id}: {e}")
-        # Same as above: an exception here means the claim was made (and
-        # possibly charged) but no review was ever produced, so refund it
-        # rather than leaving the user out of pocket for nothing.
-        await _refund_unlock_claim(
-            db.game_review_unlocks, user["user_id"], {"game_id": game_id},
-            claim, "game_review", reason=str(e),
-        )
-        # Return graceful error response
-        return {
-            "analysis": {
-                "analysis_id": f"an_{uuid.uuid4().hex[:12]}",
-                "game_id": game_id,
-                "depth": 0,
-                "summary": {"best": 0, "brilliant": 0, "inaccuracy": 0, "mistake": 0, "blunder": 0},
-                "moves": [],
-                "engine_available": False,
-                "error": str(e),
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }
-        }
+    asyncio.create_task(_run_game_review_job(job_id, game_id, user["user_id"], claim))
+    return {"status": "pending"}
 
 @api_router.post("/games/{game_id}/move")
 async def make_move(game_id: str, move_data: MoveRequest, request: Request):
@@ -5145,6 +5240,231 @@ class BoardAnalyzeRequest(BaseModel):
     multi_pv: int = 3
 
 
+# Board Editor's async analysis jobs are persisted in db.board_analysis_jobs
+# rather than kept in an in-process dict. Worth being precise about what
+# this does and doesn't buy: a restart still kills the asyncio.create_task
+# running the actual Stockfish search along with the process, so a job
+# that was genuinely mid-analysis when the server restarts loses that
+# in-progress search - there's no saved engine state to pick back up
+# from. What persistence DOES fix is any scenario where the POST that
+# creates a job and the GET that polls it can land on different
+# processes (multiple workers/instances, or a redeploy landing between
+# kickoff and the first poll) - an in-memory dict would 404 there even
+# though nothing actually went wrong. It also makes job state
+# inspectable in the DB rather than opaque in-process state.
+#
+# Because the doc holds everything _run_board_analysis_job needs (fen,
+# multi_pv, user_id, and the already-decided paid/free "budget" for this
+# analysis - see _consume_lifetime_budget), it also doubles as a resume
+# ticket: _resume_orphaned_board_analysis_jobs() (called once at
+# startup) finds any job still "pending" after a restart and re-runs the
+# search from scratch under the SAME job_id, with the SAME paid/free
+# status. The frontend, which has just been polling GET
+# /board/analyze/{job_id} the whole time, never sees anything but a
+# slightly longer "pending". See that function's docstring for the full
+# reasoning. Jobs are deleted once their result has been delivered to
+# the client (or once an error result has been delivered).
+
+
+async def _claim_job_settlement(collection, job_id: str) -> bool:
+    """Atomically claims the one-time "settle this job's ledger effect"
+    slot for job_id in `collection` - i.e. the single credits-ledger call
+    (record a free/paid use, or refund a charge) that's allowed to happen
+    for this job. Shared by both Board Editor analysis jobs
+    (db.board_analysis_jobs) and Game Review jobs (db.game_review_jobs) -
+    both persist background Stockfish work as a job doc and both need
+    the same "only settle once, even if a crash-resumed replay reruns
+    this job" guarantee.
+
+    Returns True if this call just won the claim - it's the one that
+    should actually run the ledger side effect. Returns False if some
+    earlier run of this same job_id already won it.
+
+    This exists for one specific crash window: the job runner
+    records/refunds, THEN writes the job doc's final status ("done" /
+    "error"). If the process dies in between those two writes, the job
+    doc is still "pending" - so the matching "resume orphaned jobs"
+    startup routine will replay this exact job on the next boot, which
+    would otherwise call the ledger function a second time for an effect
+    that already happened. The "settled" flag on the job doc is claimed
+    with a single atomic find_one_and_update (filtered on {"settled":
+    {"$ne": True}}), so only the run that wins the race actually touches
+    credits/usage counters - a replay that finds it already claimed does
+    everything else (re-runs Stockfish, writes the final status) but
+    skips the ledger call entirely.
+    """
+    claim = await collection.find_one_and_update(
+        {"job_id": job_id, "settled": {"$ne": True}},
+        {"$set": {"settled": True}},
+    )
+    return claim is not None
+
+
+async def _run_board_analysis_job(job_id: str, fen: str, multi_pv: int, user_id: str, budget: dict):
+    """Runs the actual Stockfish search for a board-analysis job in the
+    background, off the request/response cycle entirely, and writes the
+    result to db.board_analysis_jobs for the poll endpoint to pick up.
+
+    This exists because a genuinely deep search (ANALYSIS_DEPTH) can take
+    far longer on Render's shared/fractional CPU than any single HTTP
+    request should ever be kept open for - Render's own proxy has a
+    timeout independent of anything in this app, and a slow shared CPU can
+    blow past it even with the work correctly off the event loop
+    (asyncio.to_thread alone fixes "freezes the whole server", not "this
+    one request takes too long"). Moving the work out of the request/
+    response cycle entirely - kick off + poll - is the only way to support
+    a deep search reliably regardless of how long it actually takes.
+
+    Can run more than once for the same job_id - once from the original
+    POST /board/analyze, and again (with identical arguments) from
+    _resume_orphaned_board_analysis_jobs if the first run's process died
+    before finishing. See _claim_job_settlement for how that's kept from
+    double-recording usage or double-refunding credits.
+    """
+    try:
+        def _run():
+            local_engine = Stockfish(path=STOCKFISH_PATH, depth=ANALYSIS_DEPTH, parameters={"Threads": 1, "Hash": 128})
+            local_engine.set_fen_position(fen)
+            best_move = local_engine.get_best_move()
+            evaluation = local_engine.get_evaluation() or {}
+            top_moves = local_engine.get_top_moves(multi_pv) if multi_pv > 1 else []
+            if not best_move:
+                raise RuntimeError("Stockfish returned no move for this position")
+            return best_move, evaluation, top_moves
+
+        best_move, evaluation, top_moves = await asyncio.to_thread(_run)
+
+        # Only the run that wins the settlement claim records the free/
+        # paid use. free_remaining is still computed off budget["used"] -
+        # a snapshot taken when the job was first created, before either
+        # run recorded anything - so it comes out correct either way: at
+        # most one run ever actually increments the counter, so
+        # budget["used"] + 1 is the right post-analysis count regardless
+        # of which run (original or resumed) is the one that recorded it.
+        if await _claim_job_settlement(db.board_analysis_jobs, job_id):
+            await _record_lifetime_usage(user_id, "board_analysis")
+        free_remaining = 0 if budget["paid"] else max(0, BOARD_ANALYSIS_FREE_LIMIT - (budget["used"] + 1))
+        await db.board_analysis_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {
+                "status": "done",
+                "result": {
+                    "move": best_move,
+                    "evaluation": evaluation,
+                    "top_moves": top_moves,
+                    "depth": ANALYSIS_DEPTH,
+                    "engine_available": True,
+                    "paid": budget["paid"],
+                    "cost": budget["spend"]["cost"] if budget["spend"] else 0,
+                    "free_uses_remaining": free_remaining,
+                    "free_limit": BOARD_ANALYSIS_FREE_LIMIT,
+                },
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+    except Exception as e:
+        logger.error(f"Board Editor analysis failed (job {job_id}): {e}")
+        # All credits refunded if the analysis fails - and if it was a
+        # free use, it isn't burned either (we never called
+        # _record_lifetime_usage above in that case). Same settlement
+        # claim as the success path, so a resumed replay that fails
+        # again (e.g. a deterministically bad fen) can't refund twice.
+        if await _claim_job_settlement(db.board_analysis_jobs, job_id):
+            await _refund_lifetime_spend(user_id, budget["spend"], "board_analysis", reason=str(e))
+        await db.board_analysis_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {
+                "status": "error",
+                "error": "Deep analysis failed - any credits charged have been refunded",
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+
+
+async def _resume_orphaned_board_analysis_jobs():
+    """Crash-resume for Board Editor analysis jobs. Called once from
+    startup_tasks(), before the app starts serving traffic.
+
+    Why "pending" at this exact moment can only mean "orphaned by a
+    crash": this function runs before anything else in the new process
+    has had a chance to create an analysis job, and the old process (if
+    any) is gone by definition - a fresh boot means nothing is racing us
+    for these docs. So every job doc still sitting in status "pending"
+    right now was left mid-analysis by a previous process that died
+    (crashed, was killed, redeployed mid-search, whatever) before it
+    could write "done" or "error".
+
+    We can't resume the killed Stockfish search itself - there's no
+    saved engine state to continue from, only the inputs it started
+    with. So this re-runs the search from scratch. But "from scratch"
+    at the engine level is invisible at the product level: we replay it
+    under the exact same job_id, against the exact same fen, and - this
+    is the part that actually matters to the user - against the exact
+    same paid/free "budget" that was already decided (and, if paid,
+    already charged) back when the job was first created. The frontend
+    has been polling GET /board/analyze/{job_id} this whole time and
+    can't tell the difference between "still thinking" and "the server
+    restarted and started this job over"; it just sees pending for a bit
+    longer, then gets its result. No double-charging and no double-
+    recording: _run_board_analysis_job's ledger effect (record a free
+    use, or refund credits on failure) is guarded by an atomic per-
+    job_id claim (_claim_job_settlement) rather than by "this is the
+    first time we've run this job" - so it's safe even in the narrow
+    case where the previous process died AFTER recording/refunding but
+    BEFORE marking the job doc "done"/"error", which is exactly the
+    kind of half-finished state a crash can leave behind.
+    """
+    resumed = 0
+    async for job in db.board_analysis_jobs.find({"status": "pending"}):
+        job_id = job.get("job_id")
+        fen = job.get("fen")
+        budget = job.get("budget")
+        user_id = job.get("user_id")
+        multi_pv = job.get("multi_pv") or 1
+
+        if not job_id or not fen or budget is None or not user_id:
+            # A job doc missing the fields this needs to replay it -
+            # e.g. one created by an older deploy of this endpoint,
+            # from before fen/multi_pv/budget were persisted on it.
+            # There's nothing safe to resume, so fail it outright
+            # (refunding anything charged) instead of leaving it stuck
+            # in "pending" forever with a frontend polling it forever.
+            logger.warning(
+                f"Board Editor analysis job {job.get('job_id')} orphaned by "
+                "restart but missing fields needed to resume it - marking as error"
+            )
+            if job_id:
+                # Same settlement claim as the normal paths - if this job
+                # doc is old enough to be missing fen/budget, it predates
+                # "settled" too, so this always wins the claim in
+                # practice, but the check is cheap insurance against ever
+                # refunding the same job twice.
+                if budget is not None and await _claim_job_settlement(db.board_analysis_jobs, job_id):
+                    await _refund_lifetime_spend(
+                        user_id, budget.get("spend"), "board_analysis",
+                        reason="server restarted and job could not be resumed",
+                    )
+                await db.board_analysis_jobs.update_one(
+                    {"job_id": job_id},
+                    {"$set": {
+                        "status": "error",
+                        "error": "Deep analysis failed - any credits charged have been refunded",
+                        "updated_at": datetime.now(timezone.utc),
+                    }},
+                )
+            continue
+
+        asyncio.create_task(
+            _run_board_analysis_job(job_id, fen, multi_pv, user_id, budget)
+        )
+        resumed += 1
+
+    if resumed:
+        logger.info(
+            f"Resumed {resumed} Board Editor analysis job(s) orphaned by a restart"
+        )
+
+
 # ---- Board Editor position analysis ----
 # The Board Editor's "Analyze" button, for arbitrary custom positions (not
 # tied to any saved game). Always runs Stockfish at deep depth
@@ -5158,6 +5478,13 @@ class BoardAnalyzeRequest(BaseModel):
 # stays exactly as it is and is NOT credit-gated, because it also powers
 # the actual computer-opponent move generation in Play vs Computer -
 # gating it would have started charging people for playing bot games.
+#
+# This POST kicks the search off in the background and returns almost
+# immediately with a job_id - it does NOT wait for Stockfish to finish.
+# The frontend polls GET /board/analyze/{job_id} until status is "done"
+# or "error". See _run_board_analysis_job's docstring for why: a single
+# blocking request/response can't safely support a genuinely deep search
+# on Render's shared/fractional CPU, no matter how the work is threaded.
 @api_router.post("/board/analyze")
 async def analyze_board_position(analyze_req: BoardAnalyzeRequest, request: Request):
     user = await get_current_user(request)
@@ -5179,48 +5506,52 @@ async def analyze_board_position(analyze_req: BoardAnalyzeRequest, request: Requ
         "board_analysis", reference_id=analyze_req.fen,
     )
 
-    try:
-        # Run the blocking Stockfish call in a worker thread so it never
-        # freezes the event loop - see the identical fix + explanation on
-        # the Game Review analysis endpoint above (this endpoint had the
-        # same "call Stockfish directly in the async handler" bug, which
-        # stalls the ENTIRE server - including Socket.IO's polling
-        # keep-alives - for as long as the analysis takes).
-        def _run_board_analysis():
-            local_engine = Stockfish(path=STOCKFISH_PATH, depth=ANALYSIS_DEPTH, parameters={"Threads": 2, "Hash": 128})
-            local_engine.set_fen_position(analyze_req.fen)
-            best_move = local_engine.get_best_move()
-            evaluation = local_engine.get_evaluation() or {}
-            multi_pv = analyze_req.multi_pv if analyze_req.multi_pv and analyze_req.multi_pv > 1 else 1
-            top_moves = local_engine.get_top_moves(multi_pv) if multi_pv > 1 else []
-            if not best_move:
-                raise RuntimeError("Stockfish returned no move for this position")
-            return best_move, evaluation, top_moves
+    multi_pv = analyze_req.multi_pv if analyze_req.multi_pv and analyze_req.multi_pv > 1 else 1
+    job_id = f"ba_{uuid.uuid4().hex[:12]}"
+    await db.board_analysis_jobs.insert_one({
+        "job_id": job_id,
+        "user_id": user["user_id"],
+        "status": "pending",
+        # fen/multi_pv/budget are stored (not just passed to the task
+        # below) so that if this process dies before the job finishes,
+        # _resume_orphaned_board_analysis_jobs() has everything it needs
+        # to replay this exact analysis - same position, same paid/free
+        # status - under this same job_id after a restart.
+        "fen": analyze_req.fen,
+        "multi_pv": multi_pv,
+        "budget": budget,
+        # Claimed exactly once by _claim_job_settlement before this job's
+        # ledger effect (record usage / refund credits) runs - guards
+        # against a crash-resumed replay double-recording or double-
+        # refunding. See that function's docstring.
+        "settled": False,
+        "created_at": datetime.now(timezone.utc),
+    })
+    asyncio.create_task(
+        _run_board_analysis_job(job_id, analyze_req.fen, multi_pv, user["user_id"], budget)
+    )
 
-        best_move, evaluation, top_moves = await asyncio.to_thread(_run_board_analysis)
-    except Exception as e:
-        logger.error(f"Board Editor analysis failed: {e}")
-        # All credits refunded if the analysis fails - and if it was a
-        # free use, it isn't burned either (we never call
-        # _record_lifetime_usage below in that case).
-        await _refund_lifetime_spend(user["user_id"], budget["spend"], "board_analysis", reason=str(e))
-        raise HTTPException(status_code=503, detail="Deep analysis failed - any credits charged have been refunded")
+    return {"job_id": job_id, "status": "pending"}
 
-    await _record_lifetime_usage(user["user_id"], "board_analysis")
 
-    free_remaining = 0 if budget["paid"] else max(0, BOARD_ANALYSIS_FREE_LIMIT - (budget["used"] + 1))
+@api_router.get("/board/analyze/{job_id}")
+async def get_board_analysis_job(job_id: str, request: Request):
+    user = await get_current_user(request)
+    job = await db.board_analysis_jobs.find_one({"job_id": job_id}, {"_id": 0})
+    if not job or job.get("user_id") != user["user_id"]:
+        raise HTTPException(status_code=404, detail="Analysis job not found")
 
-    return {
-        "move": best_move,
-        "evaluation": evaluation,
-        "top_moves": top_moves,
-        "depth": ANALYSIS_DEPTH,
-        "engine_available": True,
-        "paid": budget["paid"],
-        "cost": budget["spend"]["cost"] if budget["spend"] else 0,
-        "free_uses_remaining": free_remaining,
-        "free_limit": BOARD_ANALYSIS_FREE_LIMIT,
-    }
+    if job["status"] == "pending":
+        return {"status": "pending"}
+    if job["status"] == "error":
+        await db.board_analysis_jobs.delete_one({"job_id": job_id})
+        raise HTTPException(status_code=503, detail=job["error"])
+
+    # "done" - return the stored result and delete the job doc, same shape
+    # the old synchronous endpoint used to return directly.
+    result = job["result"]
+    await db.board_analysis_jobs.delete_one({"job_id": job_id})
+    return {"status": "done", **result}
 
 
 # ---- Deep/cloud analysis on imported PGNs ----
@@ -7392,6 +7723,19 @@ async def startup_tasks():
     await db.feature_usage_counters.create_index("user_id", unique=True)
     await db.migrations.create_index("migration_id", unique=True)
 
+    # Board Editor analysis jobs: looked up by job_id on every poll, and
+    # scanned by status at startup to find jobs orphaned by a crash (see
+    # _resume_orphaned_board_analysis_jobs).
+    await db.board_analysis_jobs.create_index("job_id", unique=True)
+    await db.board_analysis_jobs.create_index("status")
+
+    # Game Review jobs: keyed uniquely on game_id (one shared Stockfish
+    # run per game, no matter how many users are reviewing it - see
+    # get_game_analysis), and scanned by status at startup for the same
+    # crash-resume reason as board_analysis_jobs above.
+    await db.game_review_jobs.create_index("game_id", unique=True)
+    await db.game_review_jobs.create_index("status")
+
     # Phase 4b: puzzle pack unlocks (persistent, like the unlocks above -
     # you buy a difficulty tier once and keep it). Daily retry/skip
     # budgets live on puzzle_progress instead, no separate index needed.
@@ -7694,6 +8038,15 @@ async def startup_tasks():
     # rather than waiting for the first /puzzles/next call to trigger it.
     puzzle_settings = await db.settings.find_one({"type": "platform"}, {"_id": 0}) or {}
     await seed_puzzles_if_needed(puzzle_settings)
+
+    # Crash-resume: re-run any Board Editor analysis jobs that were still
+    # in flight (status "pending") when the previous process died, under
+    # their original job_id, so the frontend's poll loop never notices
+    # the restart. See _resume_orphaned_board_analysis_jobs's docstring.
+    await _resume_orphaned_board_analysis_jobs()
+
+    # Same crash-resume, for Game Review jobs.
+    await _resume_orphaned_game_review_jobs()
 
 async def create_automated_tournament(tournament_type: str):
     """Create an automated tournament"""

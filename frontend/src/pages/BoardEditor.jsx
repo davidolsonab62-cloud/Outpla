@@ -387,6 +387,7 @@ export default function BoardEditor() {
   }, [boardPosition]);
 
   const analysisAbortRef = useRef(null);
+  const analysisCancelledRef = useRef(false);
 
   const handleAnalyzePosition = useCallback(async () => {
     const fen = chessRef.current.fen();
@@ -401,6 +402,7 @@ export default function BoardEditor() {
     analysisAbortRef.current?.abort();
     const controller = new AbortController();
     analysisAbortRef.current = controller;
+    analysisCancelledRef.current = false;
 
     setAnalysisLoading(true);
     setAnalysisError(null);
@@ -409,7 +411,12 @@ export default function BoardEditor() {
       // Deep Stockfish analysis of this custom position - Board Editor's
       // own 5-free-then-30-credit allowance (feature key "board_analysis").
       // Always deep depth; there's no separate quick/shallow tier.
-      const response = await axios.post(
+      //
+      // This kicks the search off in the background on the server and
+      // polls for the result instead of waiting on one long request - a
+      // genuinely deep search can take a while (especially on a shared
+      // CPU), and no single HTTP request should be held open that long.
+      const kickoff = await axios.post(
         `${API}/board/analyze`,
         {
           fen,
@@ -417,15 +424,37 @@ export default function BoardEditor() {
         },
         { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal }
       );
-      setAnalysis(response.data);
-      setFreeUsesRemaining(response.data.free_uses_remaining ?? null);
-      setAnalysisCost(response.data.cost ?? null);
-      if (response.data.paid) {
-        toast.success(`Deep analysis complete — ${response.data.cost} credits spent.`);
+      const jobId = kickoff.data.job_id;
+
+      let data = null;
+      while (!analysisCancelledRef.current) {
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        if (analysisCancelledRef.current) break;
+        // eslint-disable-next-line no-await-in-loop
+        const poll = await axios.get(`${API}/board/analyze/${jobId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: controller.signal,
+        });
+        if (poll.data.status === "done") {
+          data = poll.data;
+          break;
+        }
+        // status "pending" - keep polling
+      }
+      if (analysisCancelledRef.current || !data) {
+        return;
+      }
+
+      setAnalysis(data);
+      setFreeUsesRemaining(data.free_uses_remaining ?? null);
+      setAnalysisCost(data.cost ?? null);
+      if (data.paid) {
+        toast.success(`Deep analysis complete — ${data.cost} credits spent.`);
       }
       const entryId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       setAnalysisHistory((prev) => [
-        { id: entryId, fen, analysis: response.data, analyzedAt: Date.now() },
+        { id: entryId, fen, analysis: data, analyzedAt: Date.now() },
         ...prev,
       ].slice(0, 25));
       setActiveHistoryId(entryId);
@@ -453,6 +482,7 @@ export default function BoardEditor() {
   }, [token, navigate]);
 
   const handleStopAnalysis = useCallback(() => {
+    analysisCancelledRef.current = true;
     analysisAbortRef.current?.abort();
     analysisAbortRef.current = null;
     setAnalysisLoading(false);

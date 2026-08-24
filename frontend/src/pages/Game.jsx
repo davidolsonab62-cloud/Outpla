@@ -172,9 +172,31 @@ export default function Game() {
   // flood of repeated GET .../analysis calls / 503s in the console).
   const analysisLoadingRef = useRef(false);
   const analysisDoneRef = useRef(false); // true once we have a definitive result for this game
+  // Server-side Game Review now runs as a background job (see server.py's
+  // _run_game_review_job) so it can survive a server restart without the
+  // frontend needing to know - these two refs drive the poll loop that
+  // makes that happen: keep calling the same endpoint until it stops
+  // saying "pending", the way BoardEditor.jsx already polls /board/analyze.
+  const analysisPollTimeoutRef = useRef(null);
+  const analysisCancelledRef = useRef(false);
 
   useEffect(() => {
     analysisDoneRef.current = false; // reset the guard whenever we switch games
+    analysisLoadingRef.current = false;
+    analysisCancelledRef.current = false;
+    if (analysisPollTimeoutRef.current) {
+      clearTimeout(analysisPollTimeoutRef.current);
+      analysisPollTimeoutRef.current = null;
+    }
+    return () => {
+      // Stop polling if we navigate away/unmount mid-review - the
+      // background job itself keeps running server-side regardless.
+      analysisCancelledRef.current = true;
+      if (analysisPollTimeoutRef.current) {
+        clearTimeout(analysisPollTimeoutRef.current);
+        analysisPollTimeoutRef.current = null;
+      }
+    };
   }, [gameId]);
 
   const canShowAnalysis = reviewMode || game?.status === "completed";
@@ -235,14 +257,37 @@ export default function Game() {
     // If we already have a definitive answer (success or engine unavailable), don't keep retrying
     if (analysisDoneRef.current && !force) return;
 
+    if (analysisPollTimeoutRef.current) {
+      clearTimeout(analysisPollTimeoutRef.current);
+      analysisPollTimeoutRef.current = null;
+    }
+
     analysisLoadingRef.current = true;
     setAnalysisLoading(true);
     setAnalysisError(null);
 
+    let willPollAgain = false;
     try {
       const response = await axios.get(`${API}/games/${gameId}/analysis`, {
         headers: { Authorization: `Bearer ${token}` },
       });
+
+      // The review runs as a background job on the server (it can take a
+      // while, and now survives a server restart without losing progress
+      // or double-charging - see server.py's _run_game_review_job) - so
+      // "pending" just means "still working", not an error. Keep polling
+      // the same endpoint, the way BoardEditor.jsx polls /board/analyze.
+      if (response.data.status === "pending") {
+        if (!analysisCancelledRef.current) {
+          willPollAgain = true;
+          analysisPollTimeoutRef.current = setTimeout(() => {
+            analysisPollTimeoutRef.current = null;
+            fetchAnalysis(true);
+          }, 2000);
+        }
+        return;
+      }
+
       const analysisData = response.data.analysis || response.data;
       setAnalysis(analysisData);
       analysisDoneRef.current = true; // got a real response, stop auto-retrying
@@ -270,8 +315,13 @@ export default function Game() {
       setAnalysis(null);
       // don't set analysisDoneRef here — let the user retry via the Refresh button
     } finally {
-      analysisLoadingRef.current = false;
-      setAnalysisLoading(false);
+      // Keep the loading state (and the "in flight" guard) alive across a
+      // scheduled poll retry - only clear it once we have a definitive
+      // result (or gave up) and nothing else is queued.
+      if (!willPollAgain) {
+        analysisLoadingRef.current = false;
+        setAnalysisLoading(false);
+      }
     }
   }, [gameId, token]);
 
