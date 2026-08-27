@@ -1734,7 +1734,7 @@ async def register(request: Request, user_data: UserCreate, response: Response):
         "wins": 0,
         "losses": 0,
         "draws": 0,
-        "wallet_balance": {"USDT": 100.0, "BTC": 0.001, "ETH": 0.01},
+        "wallet_balance": {"USDT": 10.0, "BTC": 0.001, "ETH": 0.01},
         "credits_balance": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "is_admin": False,
@@ -2015,7 +2015,7 @@ async def create_session(request: Request, response: Response):
             "wins": 0,
             "losses": 0,
             "draws": 0,
-            "wallet_balance": {"USDT": 100.0, "BTC": 0.001, "ETH": 0.01},
+            "wallet_balance": {"USDT": 10.0, "BTC": 0.001, "ETH": 0.01},
             "credits_balance": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "is_admin": False,
@@ -4778,7 +4778,7 @@ async def get_credits_transactions(request: Request):
 # credits_balance - do not add one.
 #
 # Currently USDT-only. USDT is the only wallet currency this codebase
-# already treats as $-pegged (see the 100.0 starting balance vs 0.001 BTC /
+# already treats as $-pegged (see the 10.0 starting balance vs 0.001 BTC /
 # 0.01 ETH), and the locked 100 credits = $1 exchange rate needs a USD
 # value to apply to. Supporting BTC/ETH purchases would need a live price
 # feed, which doesn't exist yet - flagged rather than guessed at.
@@ -5011,8 +5011,6 @@ async def admin_set_credit_feature_cost(feature_key: str, update: CreditFeatureC
 #                             counter, per spec.
 #   - "pgn_deep_analysis"    deep analysis of an arbitrary imported PGN,
 #                             charged once per distinct PGN per user
-#   - "opening_explorer_deep" per-query cost for opening-explorer lookups
-#                             beyond the free shallow depth
 #
 # None of these have a cost until an admin sets one via the endpoint
 # above - spend_credits() 500s on an unpriced feature_key by design, so a
@@ -5028,10 +5026,6 @@ async def admin_set_credit_feature_cost(feature_key: str, update: CreditFeatureC
 
 ANALYSIS_DEPTH = 20  # deep depth used by both Game Review and Board Editor analysis
 PGN_ANALYSIS_DEPTH = 18
-# First 3 full moves (6 ply) of the in-house opening explorer are free;
-# looking deeper than that costs credits. "Basic depth" per the spec.
-OPENING_EXPLORER_FREE_PLY = 6
-
 # Caps how many of these deep (Hash: 128MB+) Stockfish subprocesses can
 # run at once - across Board Editor and Game Review's background jobs,
 # and the older synchronous Game Review / PGN-import analysis endpoints
@@ -5681,86 +5675,6 @@ async def analyze_imported_pgn(analyze_data: PGNAnalyzeRequest, request: Request
     )
     return {"success": True, "analysis": analysis_doc, "cached": False}
 
-
-# ---- Opening explorer ----
-# A basic in-house opening explorer sourced from StakeChess's own
-# completed games (not an external database - there isn't one in this
-# codebase). Queried by a comma-separated UCI move prefix; the first
-# OPENING_EXPLORER_FREE_PLY ply are free, going deeper costs credits per
-# query (feature key "opening_explorer_deep") - there's no persistent
-# unlock here since it's a live query over changing game data, not a
-# one-time compute like the review/analysis features above.
-
-@api_router.get("/opening-explorer")
-async def opening_explorer(request: Request, moves: str = ""):
-    user = await get_current_user(request)
-
-    move_list = [m.strip() for m in moves.split(",") if m.strip()] if moves else []
-    ply = len(move_list)
-
-    spend_result = None
-    if ply > OPENING_EXPLORER_FREE_PLY:
-        spend_result = await spend_credits(
-            user["user_id"],
-            "opening_explorer_deep",
-            reference_id="-".join(move_list) or "start",
-            metadata={"ply": ply, "moves": move_list},
-        )
-
-    # Mongo can't express "array length >= N" with a plain query filter,
-    # so $expr is needed to make sure the game actually has a move at
-    # index `ply` before we look at moves.{ply} below.
-    query: Dict[str, Any] = {
-        "status": "completed",
-        "$expr": {"$gte": [{"$size": {"$ifNull": ["$moves", []]}}, ply + 1]},
-    }
-    for i, mv in enumerate(move_list):
-        query[f"moves.{i}"] = mv
-
-    cursor = db.games.find(
-        query,
-        {"_id": 0, "moves": 1, "result": 1},
-    ).limit(2000)
-
-    next_move_stats: Dict[str, Dict[str, int]] = {}
-    total = 0
-    async for g in cursor:
-        game_moves = g.get("moves", [])
-        if len(game_moves) <= ply:
-            continue
-        next_move = game_moves[ply]
-        stats = next_move_stats.setdefault(
-            next_move, {"games": 0, "white_wins": 0, "black_wins": 0, "draws": 0}
-        )
-        stats["games"] += 1
-        total += 1
-        result = g.get("result")
-        if result == "white":
-            stats["white_wins"] += 1
-        elif result == "black":
-            stats["black_wins"] += 1
-        elif result == "draw":
-            stats["draws"] += 1
-
-    next_moves = [
-        {
-            "move": mv,
-            "games": s["games"],
-            "white_win_pct": round(100 * s["white_wins"] / s["games"], 1),
-            "black_win_pct": round(100 * s["black_wins"] / s["games"], 1),
-            "draw_pct": round(100 * s["draws"] / s["games"], 1),
-        }
-        for mv, s in sorted(next_move_stats.items(), key=lambda kv: -kv[1]["games"])
-    ]
-
-    return {
-        "ply": ply,
-        "total_games": total,
-        "next_moves": next_moves,
-        "free": ply <= OPENING_EXPLORER_FREE_PLY,
-        "free_ply_limit": OPENING_EXPLORER_FREE_PLY,
-        "spend": spend_result,
-    }
 
 # ============= WALLET ROUTES =============
 
@@ -7859,8 +7773,8 @@ async def startup_tasks():
         upsert=True,
     )
 
-    # Phase 4a: initial prices for game review/PGN deep analysis/opening
-    # explorer depth. Same $setOnInsert + upsert pattern as 4b/4c/4d/4e -
+    # Phase 4a: initial prices for game review/PGN deep analysis.
+    # Same $setOnInsert + upsert pattern as 4b/4c/4d/4e -
     # without this, spend_credits() 500s on these feature keys (no
     # configured cost) and Phase 4a is dead on arrival. Never overwrites a
     # price an admin has since changed via
@@ -7868,7 +7782,6 @@ async def startup_tasks():
     phase_4a_costs = {
         "board_analysis": 30,
         "pgn_deep_analysis": 30,
-        "opening_explorer_deep": 5,
     }
     for feature_key, cost in phase_4a_costs.items():
         await db.credit_feature_costs.update_one(

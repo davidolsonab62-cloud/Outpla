@@ -42,8 +42,8 @@ export default function Register() {
       const creditsGranted = userData?.credits_balance;
       toast.success(
         creditsGranted
-          ? `Account created! You've received $100 USDT demo balance and ${creditsGranted.toLocaleString()} free credits.`
-          : "Account created! You've received $100 USDT demo balance."
+          ? `Account created! You've received $10 USDT demo balance and ${creditsGranted.toLocaleString()} free credits.`
+          : "Account created! You've received $10 USDT demo balance."
       );
       navigate("/lobby");
     } catch (error) {
@@ -100,7 +100,7 @@ export default function Register() {
               up. The post-signup toast above uses the actual granted amount. */}
           <div className="mb-6 p-4 bg-brand-dim border border-brand rounded-xl">
             <p className="text-brand text-sm text-center">
-              New accounts receive <span className="font-bold">$100 USDT</span> demo balance and{" "}
+              New accounts receive <span className="font-bold">$10 USDT</span> demo balance and{" "}
               <span className="font-bold">400 free credits</span>!
             </p>
           </div>

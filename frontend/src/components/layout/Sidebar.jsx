@@ -46,7 +46,6 @@ const NAV_ITEMS = [
   { to: "/live", label: "Watch", icon: "◉" },
   { to: "/puzzles", label: "Puzzles", icon: "★" },
   { to: "/study", label: "Study", icon: "📚" },
-  { to: "/opening-explorer", label: "Opening Explorer", icon: "♞" },
   { to: "/leaderboard", label: "Leaderboard", icon: "◎" },
   { to: "/challenge-queue", label: "Challenges", icon: "⚔" },
   { to: "/messages", label: "Messages", icon: "✉" },

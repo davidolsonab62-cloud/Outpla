@@ -42,7 +42,6 @@ import Terms from "@/pages/Terms";
 import Privacy from "@/pages/Privacy";
 import DatabaseInfo from "@/pages/Database";
 import Support from "@/pages/Support";
-import OpeningExplorer from "@/pages/OpeningExplorer";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || window.location.origin;
 export const API = `${BACKEND_URL}/api`;
@@ -632,14 +631,6 @@ function AppRouter() {
           element={
             <ProtectedRoute>
               <ImportPGN />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/opening-explorer"
-          element={
-            <ProtectedRoute>
-              <OpeningExplorer />
             </ProtectedRoute>
           }
         />
