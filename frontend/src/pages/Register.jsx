@@ -94,6 +94,17 @@ export default function Register() {
             </p>
           </div>
 
+          {/* Bonus notice. "400 free credits" mirrors the backend's
+              SIGNUP_BONUS_CREDITS - display-only, since there's no user
+              object yet to read the real value from before they've signed
+              up. The post-signup toast above uses the actual granted amount. */}
+          <div className="mb-6 p-4 bg-success-dim border border-success rounded-xl">
+            <p className="text-success text-sm text-center">
+              New accounts receive <span className="font-bold">$100 USDT</span> demo balance and{" "}
+              <span className="font-bold">400 free credits</span>!
+            </p>
+          </div>
+
           <form onSubmit={handleSubmit} className="space-y-5">
             <div className="space-y-2">
               <Label htmlFor="username" className="text-ink-secondary">
@@ -240,17 +251,6 @@ export default function Register() {
             >
               Sign in
             </Link>
-          </p>
-        </div>
-
-        {/* Bonus notice. "400 free credits" mirrors the backend's
-            SIGNUP_BONUS_CREDITS - display-only, since there's no user
-            object yet to read the real value from before they've signed
-            up. The post-signup toast above uses the actual granted amount. */}
-        <div className="mt-6 p-4 bg-success-dim border border-success rounded-xl">
-          <p className="text-success text-sm text-center">
-            🎁 New accounts receive <span className="font-bold">$100 USDT</span> demo balance and{" "}
-            <span className="font-bold">400 free credits</span>!
           </p>
         </div>
       </div>
