@@ -98,8 +98,8 @@ export default function Register() {
               SIGNUP_BONUS_CREDITS - display-only, since there's no user
               object yet to read the real value from before they've signed
               up. The post-signup toast above uses the actual granted amount. */}
-          <div className="mb-6 p-4 bg-success-dim border border-success rounded-xl">
-            <p className="text-success text-sm text-center">
+          <div className="mb-6 p-4 bg-brand-dim border border-brand rounded-xl">
+            <p className="text-brand text-sm text-center">
               New accounts receive <span className="font-bold">$100 USDT</span> demo balance and{" "}
               <span className="font-bold">400 free credits</span>!
             </p>
