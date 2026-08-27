@@ -1688,6 +1688,27 @@ async def apply_abandonment_penalty(user_id: str, game_id: str, stake_amount: fl
 
 # ============= AUTH ROUTES =============
 
+async def _unique_username(base: str) -> str:
+    """Resolve a username to one that's free in db.users, for signup paths
+    (OAuth) that don't get to hard-reject on collision the way manual
+    /register does - a Google/OAuth login must always succeed. Tries the
+    name as-is first, then appends a short numeric suffix until it finds
+    an unused one. Bounded so a pathological run of collisions can't loop
+    forever."""
+    base = (base or "player").strip() or "player"
+    candidate = base
+    suffix = 1
+    while await db.users.find_one({"username": candidate}, {"_id": 0, "user_id": 1}):
+        suffix += 1
+        candidate = f"{base} {suffix}"
+        if suffix > 1000:
+            # Astronomically unlikely, but never spin forever - fall back to
+            # something guaranteed unique.
+            candidate = f"{base} {uuid.uuid4().hex[:6]}"
+            break
+    return candidate
+
+
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(request: Request, user_data: UserCreate, response: Response):
     existing_user = await db.users.find_one({"$or": [
@@ -1982,9 +2003,11 @@ async def create_session(request: Request, response: Response):
     
     if not user:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
+        requested_username = oauth_data.get("name") or email.split("@")[0]
+        username = await _unique_username(requested_username)
         user = {
             "user_id": user_id,
-            "username": oauth_data.get("name", email.split("@")[0]),
+            "username": username,
             "email": email,
             "picture": oauth_data.get("picture"),
             "rating": 1200,
