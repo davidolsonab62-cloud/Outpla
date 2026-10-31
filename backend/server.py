@@ -28,6 +28,7 @@ import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from push_service import init_push, notify_user
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -946,6 +947,14 @@ async def create_tournament_game(tournament: dict, white_player: dict, black_pla
             "opponent": white_player,
             "time_control": tournament["time_control"]
         }, room=f"user_{black_player['user_id']}")
+
+    for _p, _opp in ((white_player, black_player), (black_player, white_player)):
+        if _p and _p.get("user_id"):
+            notify_user(
+                _p["user_id"], "🏆 Your tournament match is ready",
+                f"vs {(_opp or {}).get('username') or 'your opponent'} - tap to play",
+                url=f"/game/{game_id}", tag=f"tmatch-{game_id}",
+            )
 
     return game_id
 
@@ -3522,6 +3531,17 @@ async def make_move(game_id: str, move_data: MoveRequest, request: Request):
     print(f"[PRINT] 🎯 About to emit move_made to room '{room_name}': payload={payload}, clients_in_room={len(room_clients)}")
     
     await sio.emit('move_made', payload, room=room_name)
+
+    try:
+        _np = game["white_player"] if next_turn == "white" else game["black_player"]
+        _uid = (_np or {}).get("user_id")
+        if _uid and _uid != user["user_id"] and not str(_uid).lower().startswith(("bot", "computer", "ai_")):
+            notify_user(
+                _uid, "♟ Your move", f"{user.get('username') or 'Your opponent'} has moved",
+                url=f"/game/{game_id}", tag=f"move-{game_id}",
+            )
+    except Exception:
+        logger.exception("push: move notification failed")
     
     logger.info(f"✅ Emitted move_made to room '{room_name}'")
     print(f"[PRINT] ✅ Emitted move_made to room '{room_name}'")
@@ -3977,6 +3997,13 @@ async def create_challenge(request: Request):
     except Exception:
         logger.exception("Failed to emit challenge_received")
 
+    notify_user(
+        target_user_id,
+        f"♟ Challenge from {user.get('username') or 'a player'}",
+        (message or "wants to play a game with you"),
+        url="/challenge-queue", tag=f"challenge-{challenge_id}",
+    )
+
     return {"success": True, "challenge_id": challenge_id, "credits_charged": budget_result["paid"]}
 
 
@@ -4055,6 +4082,13 @@ async def accept_challenge(challenge_id: str, request: Request):
     except Exception:
         logger.exception("Failed to emit challenge_accepted")
 
+    notify_user(
+        challenge.get("from_user_id"),
+        f"{user.get('username') or 'Your opponent'} accepted your challenge",
+        "Your game is ready - tap to play",
+        url=f"/game/{challenge.get('game_id')}", tag=f"challenge-{challenge_id}",
+    )
+
     response = {"success": True, "game_id": challenge.get("game_id")}
     if activated_game is not None:
         response["game"] = activated_game
@@ -4091,6 +4125,13 @@ async def reject_challenge(challenge_id: str, request: Request):
     except Exception:
         logger.exception("Failed to emit challenge_rejected")
 
+    notify_user(
+        challenge.get("from_user_id"),
+        f"{user.get('username') or 'Your opponent'} declined your challenge",
+        "Tap to find another opponent",
+        url="/lobby", tag=f"challenge-{challenge_id}",
+    )
+
     return {"success": True}
 
 
@@ -4125,6 +4166,10 @@ async def send_direct_message(request: Request):
         emit_doc["from_username"] = user.get("username")
         await sio.emit('direct_message', emit_doc, room=f"user_{to_user}")
         await sio.emit('direct_message', emit_doc, room=f"user_{user['user_id']}")
+        notify_user(
+            to_user, f"💬 {user.get('username') or 'New message'}", str(message)[:140],
+            url="/messages", tag=f"dm-{user['user_id']}",
+        )
 
         return {"success": True, "message": emit_doc}
     except Exception as e:
@@ -7194,6 +7239,8 @@ async def admin_confirm_withdrawal(withdrawal_id: str, request: Request):
         "message": "Your withdrawal has been confirmed and processed.",
         "admin_note": admin_note
     }, room=f"user_{withdrawal['user_id']}")
+    notify_user(withdrawal["user_id"], "✅ Withdrawal confirmed",
+                "Your withdrawal has been confirmed and processed.", url="/wallet", tag=f"wd-{withdrawal_id}")
     
     logger.info(f"Withdrawal {withdrawal_id} confirmed by admin {admin['user_id']}")
     
@@ -7258,6 +7305,8 @@ async def admin_reject_withdrawal(withdrawal_id: str, request: Request):
         "message": "Your withdrawal was rejected. Balance has been refunded.",
         "admin_note": admin_note
     }, room=f"user_{withdrawal['user_id']}")
+    notify_user(withdrawal["user_id"], "Withdrawal rejected",
+                "Your withdrawal was rejected and your balance was refunded.", url="/wallet", tag=f"wd-{withdrawal_id}")
     
     logger.info(f"Withdrawal {withdrawal_id} rejected by admin {admin['user_id']}, balance refunded")
     
@@ -7713,6 +7762,8 @@ async def auth_login_options(request: Request):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
+
+init_push(db, api_router, get_current_user)
 
 # Include the router in the main app
 app.include_router(api_router)

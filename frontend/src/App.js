@@ -42,6 +42,7 @@ import Terms from "@/pages/Terms";
 import Privacy from "@/pages/Privacy";
 import DatabaseInfo from "@/pages/Database";
 import Support from "@/pages/Support";
+import PushManager from "@/components/PushManager";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || window.location.origin;
 export const API = `${BACKEND_URL}/api`;
@@ -685,6 +686,7 @@ function App() {
           <ThemeProvider>
             <AuthProvider>
               <AppRouter />
+              <PushManager />
               <ThemedToaster />
             </AuthProvider>
           </ThemeProvider>
