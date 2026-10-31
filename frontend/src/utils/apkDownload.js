@@ -2,10 +2,10 @@ import { toast } from "sonner";
 import { Capacitor } from "@capacitor/core";
 
 /* Where the APK lives. Default: served from the same site (put the file in
-   frontend/public/downloads/stakechess.apk). Override with REACT_APP_APK_URL
+   frontend/public/downloads/outpla.apk). Override with REACT_APP_APK_URL
    to point at a GitHub Release / S3 / CDN link instead. */
-export const APK_URL = process.env.REACT_APP_APK_URL || "/downloads/stakechess.apk";
-export const APK_FILENAME = "StakeChess.apk";
+export const APK_URL = process.env.REACT_APP_APK_URL || "/downloads/outpla.apk";
+export const APK_FILENAME = "Outpla.apk";
 
 /* True when running inside the installed Android/iOS app (Capacitor).
    The download button is hidden there - they already have the app. */
@@ -46,7 +46,7 @@ async function apkIsAvailable() {
 
 export async function downloadApk() {
   if (isIOS()) {
-    toast.info("The Android app can't be installed on iPhone. Open StakeChess in Safari and use Share > Add to Home Screen.");
+    toast.info("The Android app can't be installed on iPhone. Open Outpla in Safari and use Share > Add to Home Screen.");
     return;
   }
   const ok = await apkIsAvailable();
