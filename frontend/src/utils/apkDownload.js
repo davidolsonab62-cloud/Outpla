@@ -1,4 +1,5 @@
 import { toast } from "sonner";
+import { Capacitor } from "@capacitor/core";
 
 /* Where the APK lives. Default: served from the same site (put the file in
    frontend/public/downloads/stakechess.apk). Override with REACT_APP_APK_URL
@@ -10,7 +11,15 @@ export const APK_FILENAME = "StakeChess.apk";
    The download button is hidden there - they already have the app. */
 export function isNativeApp() {
   try {
-    return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+    // 1. Official Capacitor check (works once the bridge is up)
+    if (Capacitor.isNativePlatform()) return true;
+    // 2. Raw global injected by the native bridge
+    if (window.Capacitor?.isNativePlatform?.()) return true;
+    // 3. Fallbacks: the app's origin, and Android's WebView user-agent marker.
+    //    (Chrome and Custom Tabs do not contain "; wv)".)
+    if (window.location.protocol === "capacitor:") return true;
+    if (/; wv\)/.test(navigator.userAgent) && /Android/.test(navigator.userAgent)) return true;
+    return false;
   } catch {
     return false;
   }
