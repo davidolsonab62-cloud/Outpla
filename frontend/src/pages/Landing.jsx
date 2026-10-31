@@ -15,7 +15,9 @@ import {
   Play,
   Sun,
   Moon,
+  Download,
 } from "lucide-react";
+import { downloadApk, isNativeApp } from "@/utils/apkDownload";
 
 /* Nav stays minimal: Dashboard, News, and the auth action.
    Leaderboard / Wallet / Profile / Admin live in the app shell, not here. */
@@ -160,6 +162,7 @@ export default function Landing() {
   const { theme, toggleTheme } = useTheme();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const isDark = theme === "dark";
+  const showDownload = !isNativeApp();
 
   // Nav hides on scroll-down, reveals on scroll-up — tracks the last
   // scroll position and compares each tick.
@@ -235,6 +238,22 @@ export default function Landing() {
               </Link>
             ))}
 
+            {showDownload && (
+              <MotionButton
+                onClick={downloadApk}
+                variant="outline"
+                data-testid="download-apk-nav"
+                className="ml-1 font-semibold"
+                style={{ borderColor: "var(--hairline)", color: "var(--text-primary)", background: "transparent" }}
+                whileHover={{ y: -2 }}
+                whileTap={{ scale: 0.96 }}
+                transition={BUTTON_SPRING}
+              >
+                <Download className="w-4 h-4 mr-1.5" />
+                Get the app
+              </MotionButton>
+            )}
+
             <motion.button
               onClick={toggleTheme}
               aria-label={isDark ? "Switch to light mode" : "Switch to dark mode"}
@@ -299,6 +318,17 @@ export default function Landing() {
                 {l.label}
               </button>
             ))}
+            {showDownload && (
+              <button
+                onClick={() => { setMobileMenuOpen(false); downloadApk(); }}
+                data-testid="download-apk-mobile"
+                className="sc-nav-row text-left rounded-lg px-3 py-2.5 text-[14px] font-medium flex items-center gap-2"
+                style={{ color: "var(--text-secondary)", background: "transparent" }}
+              >
+                <Download className="w-4 h-4" />
+                Download Android app
+              </button>
+            )}
             <button
               onClick={toggleTheme}
               className="sc-nav-row text-left rounded-lg px-3 py-2.5 text-[14px] font-medium"
@@ -404,6 +434,20 @@ export default function Landing() {
                   <Play className="w-4 h-4 mr-1.5" />
                   WATCH LIVE
                 </MotionButton>
+                {showDownload && (
+                  <MotionButton
+                    onClick={downloadApk}
+                    variant="outline"
+                    data-testid="download-apk-hero"
+                    className="sc-hero-ghost font-semibold px-6 h-12 rounded-xl text-[13.5px] tracking-wide"
+                    whileHover={{ y: -3 }}
+                    whileTap={{ scale: 0.96, y: -1 }}
+                    transition={BUTTON_SPRING}
+                  >
+                    <Download className="w-4 h-4 mr-1.5" />
+                    DOWNLOAD APP
+                  </MotionButton>
+                )}
               </div>
 
               {/* social proof */}

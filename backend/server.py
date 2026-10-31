@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 from urllib.parse import urlencode, parse_qs
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 import uuid
 from datetime import datetime, timezone, timedelta
 import requests
@@ -108,7 +108,14 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 # JWT Configuration
-SECRET_KEY = os.environ.get('JWT_SECRET', 'stakechess-secret-key-change-in-production')
+SECRET_KEY = os.environ.get('JWT_SECRET')
+if not SECRET_KEY:
+    # Never fall back to a hard-coded, publicly known secret: anyone could forge
+    # tokens with it. An ephemeral random key is safe (but logs JWT users out on
+    # every restart and breaks multi-worker setups) - set JWT_SECRET in production.
+    import secrets as _secrets
+    SECRET_KEY = _secrets.token_urlsafe(64)
+    print("[SECURITY] JWT_SECRET is not set - using a temporary random secret. Set JWT_SECRET in your environment.")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 
@@ -167,19 +174,23 @@ for port in ['3000', '3001', '3002', '3006']:
     local_origin = f'http://127.0.0.1:{port}'
     if local_origin not in cors_origins_list:
         cors_origins_list.append(local_origin)
+# Origins used by the Capacitor Android/iOS app wrapper (WebView)
+for _app_origin in ['https://localhost', 'http://localhost', 'capacitor://localhost']:
+    if _app_origin not in cors_origins_list:
+        cors_origins_list.append(_app_origin)
 if not cors_origins_list:
     cors_origins_list = ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:3006']
 
 # Allow the local dev machine to use either localhost or 127.0.0.1 on the common ports.
-allow_origin_regex = r"^https?://(localhost|127\.0\.0\.1):(3000|3001|3002|3006)$"
+allow_origin_regex = r"^(https?://(localhost|127\.0\.0\.1)(:(3000|3001|3002|3006))?|capacitor://localhost)$"
 
 # Socket.IO server - configured for proxy/kubernetes environment
 sio = socketio.AsyncServer(
     async_mode='asgi',
     # Let FastAPI's CORSMiddleware handle CORS headers to avoid duplicate Access-Control-Allow-Origin
     cors_allowed_origins=[],
-    logger=True,
-    engineio_logger=True,
+    logger=os.environ.get('SOCKETIO_DEBUG', 'false').lower() in ('true', '1', 'yes'),
+    engineio_logger=os.environ.get('SOCKETIO_DEBUG', 'false').lower() in ('true', '1', 'yes'),
     ping_timeout=60,
     ping_interval=25,
     max_http_buffer_size=1e6,
@@ -302,8 +313,8 @@ class TokenResponse(BaseModel):
 
 class GameCreate(BaseModel):
     time_control: str = "10+0"
-    stake_amount: float = 0
-    stake_currency: str = "USDT"
+    stake_amount: float = Field(default=0, ge=0, le=1_000_000, allow_inf_nan=False)
+    stake_currency: Literal["USDT", "BTC", "ETH"] = "USDT"
     is_private: bool = False
     game_type: str = "rapid"
     tournament_id: Optional[str] = None
@@ -384,14 +395,17 @@ class WalletTransaction(BaseModel):
     related_game_id: Optional[str] = None
 
 class DepositRequest(BaseModel):
-    amount: float
-    currency: str
+    # Admin-only crediting: positive, finite amount in a supported currency.
+    amount: float = Field(gt=0, le=1_000_000, allow_inf_nan=False)
+    currency: Literal["USDT", "BTC", "ETH"]
+    user_id: Optional[str] = None  # credit another user; defaults to the caller
+    note: Optional[str] = Field(default=None, max_length=200)
 
 class WithdrawRequest(BaseModel):
-    amount: float
-    currency: str
-    wallet_address: str
-    withdrawal_method: str = "crypto"  # crypto, bank_transfer, etc.
+    amount: float = Field(gt=0, le=1_000_000, allow_inf_nan=False)
+    currency: Literal["USDT", "BTC", "ETH"]
+    wallet_address: str = Field(min_length=10, max_length=200)
+    withdrawal_method: str = Field(default="crypto", max_length=40)  # crypto, bank_transfer, etc.
 
 class WithdrawStatusUpdate(BaseModel):
     status: str  # confirmed, rejected
@@ -488,8 +502,8 @@ class PuzzleProgressResponse(BaseModel):
 class TournamentCreate(BaseModel):
     name: str
     time_control: str = "3+2"
-    entry_fee: float = 5.0
-    entry_currency: str = "USDT"
+    entry_fee: float = Field(default=5.0, ge=0, le=100_000, allow_inf_nan=False)
+    entry_currency: Literal["USDT", "BTC", "ETH"] = "USDT"
     min_players: int = 4
     max_players: int = 64
     tournament_type: str = "arena"
@@ -504,8 +518,8 @@ class TournamentCreate(BaseModel):
 class PrivateTournamentCreate(BaseModel):
     name: str
     time_control: str = "3+2"
-    entry_fee: float = 0
-    entry_currency: str = "USDT"
+    entry_fee: float = Field(default=0, ge=0, le=100_000, allow_inf_nan=False)
+    entry_currency: Literal["USDT", "BTC", "ETH"] = "USDT"
     min_players: int = 2
     max_players: int = 16
     tournament_type: str = "arena"
@@ -1291,6 +1305,23 @@ async def get_admin_user(request: Request) -> dict:
     if not user.get("is_admin", False):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+SUPPORTED_CURRENCIES = ("USDT", "BTC", "ETH")
+
+async def debit_wallet(user_id: str, currency: str, amount: float) -> None:
+    """Atomically deduct `amount` from a user's wallet.
+
+    The balance check lives in the update filter, so two concurrent requests
+    can't both pass a read-then-write check and spend the same funds twice.
+    Raises 400 if the amount/currency is invalid or the balance is too low."""
+    if currency not in SUPPORTED_CURRENCIES or not (amount > 0) or amount != amount:
+        raise HTTPException(status_code=400, detail="Invalid amount or currency")
+    result = await db.users.update_one(
+        {"user_id": user_id, f"wallet_balance.{currency}": {"$gte": amount}},
+        {"$inc": {f"wallet_balance.{currency}": -amount}},
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
 
 def calculate_elo_change(winner_rating: int, loser_rating: int, k: int = 32) -> tuple:
     expected_winner = 1 / (1 + 10 ** ((loser_rating - winner_rating) / 400))
@@ -2136,14 +2167,7 @@ async def create_game(game_data: GameCreate, request: Request):
     base_time = int(parts[0]) * 60
     
     if game_data.stake_amount > 0:
-        balance = user.get("wallet_balance", {}).get(game_data.stake_currency, 0)
-        if balance < game_data.stake_amount:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-        
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$inc": {f"wallet_balance.{game_data.stake_currency}": -game_data.stake_amount}}
-        )
+        await debit_wallet(user["user_id"], game_data.stake_currency, game_data.stake_amount)
         
         await db.transactions.insert_one({
             "tx_id": f"tx_{uuid.uuid4().hex[:12]}",
@@ -2206,14 +2230,7 @@ async def _activate_waiting_game(game_id: str, user: dict) -> dict:
         raise HTTPException(status_code=400, detail="Cannot join your own game")
 
     if game["stake_amount"] > 0:
-        balance = user.get("wallet_balance", {}).get(game["stake_currency"], 0)
-        if balance < game["stake_amount"]:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$inc": {f"wallet_balance.{game['stake_currency']}": -game["stake_amount"]}}
-        )
+        await debit_wallet(user["user_id"], game["stake_currency"], game["stake_amount"])
         await db.transactions.insert_one({
             "tx_id": f"tx_{uuid.uuid4().hex[:12]}",
             "user_id": user["user_id"],
@@ -4279,14 +4296,7 @@ async def _join_tournament_player(tournament: dict, user: dict) -> None:
     tournament_id = tournament["tournament_id"]
 
     if tournament["entry_fee"] > 0:
-        balance = user.get("wallet_balance", {}).get(tournament["entry_currency"], 0)
-        if balance < tournament["entry_fee"]:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$inc": {f"wallet_balance.{tournament['entry_currency']}": -tournament["entry_fee"]}}
-        )
+        await debit_wallet(user["user_id"], tournament["entry_currency"], tournament["entry_fee"])
 
         await db.transactions.insert_one({
             "tx_id": f"tx_{uuid.uuid4().hex[:12]}",
@@ -5680,39 +5690,43 @@ async def analyze_imported_pgn(analyze_data: PGNAnalyzeRequest, request: Request
 
 @api_router.post("/wallet/deposit")
 async def deposit(deposit_data: DepositRequest, request: Request):
-    user = await get_current_user(request)
-    
-    await db.users.update_one(
-        {"user_id": user["user_id"]},
+    """Credit a wallet. ADMIN ONLY.
+
+    This used to let any logged-in user credit themselves any amount with no
+    payment check. Real deposits arrive on-chain to the addresses shown in the
+    Wallet page, and an admin credits them here after confirming the transfer."""
+    admin = await get_admin_user(request)
+    target_id = deposit_data.user_id or admin["user_id"]
+
+    result = await db.users.update_one(
+        {"user_id": target_id},
         {"$inc": {f"wallet_balance.{deposit_data.currency}": deposit_data.amount}}
     )
-    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
     await db.transactions.insert_one({
         "tx_id": f"tx_{uuid.uuid4().hex[:12]}",
-        "user_id": user["user_id"],
+        "user_id": target_id,
         "tx_type": "deposit",
         "amount": deposit_data.amount,
         "currency": deposit_data.currency,
         "status": "completed",
+        "credited_by": admin["user_id"],
+        "note": deposit_data.note,
         "created_at": datetime.now(timezone.utc).isoformat()
     })
-    
-    updated_user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    logger.info(f"Admin {admin['user_id']} credited {deposit_data.amount} {deposit_data.currency} to {target_id}")
+
+    updated_user = await db.users.find_one({"user_id": target_id}, {"_id": 0})
     return {"success": True, "wallet_balance": updated_user.get("wallet_balance")}
 
 @api_router.post("/wallet/withdraw")
 async def withdraw(withdraw_data: WithdrawRequest, request: Request):
     user = await get_current_user(request)
     
-    balance = user.get("wallet_balance", {}).get(withdraw_data.currency, 0)
-    if balance < withdraw_data.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
-    
-    # Deduct balance immediately (will be refunded if rejected)
-    await db.users.update_one(
-        {"user_id": user["user_id"]},
-        {"$inc": {f"wallet_balance.{withdraw_data.currency}": -withdraw_data.amount}}
-    )
+    # Deduct balance immediately and atomically (refunded if rejected)
+    await debit_wallet(user["user_id"], withdraw_data.currency, withdraw_data.amount)
     
     # Create withdrawal request
     withdrawal_id = f"wd_{uuid.uuid4().hex[:12]}"
@@ -6216,6 +6230,10 @@ async def admin_adjust_balance(user_id: str, request: Request):
     
     currency = body.get("currency", "USDT")
     amount = body.get("amount", 0)
+    if currency not in SUPPORTED_CURRENCIES:
+        raise HTTPException(status_code=400, detail="Unsupported currency")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)) or amount != amount or abs(amount) > 1_000_000:
+        raise HTTPException(status_code=400, detail="Invalid amount")
     
     await db.users.update_one(
         {"user_id": user_id},
@@ -7670,13 +7688,15 @@ async def root():
 
 # Temporary debug route to inspect active socket rooms and members
 @api_router.get("/debug/rooms")
-async def debug_rooms():
+async def debug_rooms(request: Request):
+    await get_admin_user(request)
     # Convert sets to lists for JSON serialization
     return {room: list(sids) for room, sids in game_connections.items()}
 
 
 @api_router.get("/debug/cors")
-async def debug_cors():
+async def debug_cors(request: Request):
+    await get_admin_user(request)
     # Return the effective CORS configuration for debugging
     return {
         "cors_origins_list": cors_origins_list,

@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">OutPla</string>
+    <string name="title_activity_main">OutPla</string>
+    <string name="package_name">com.outpla.app</string>
+    <string name="custom_url_scheme">com.outpla.app</string>
+</resources>

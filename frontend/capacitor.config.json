@@ -1,0 +1,11 @@
+{
+  "appId": "com.outpla.app",
+  "appName": "OutPla",
+  "webDir": "build",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}
